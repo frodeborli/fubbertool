@@ -1,0 +1,35 @@
+{
+    "name": "fubber/fubber",
+    "description": "Multi-language codebase inspection tool using reflection and static analysis",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "reflection",
+        "documentation",
+        "code-inspection",
+        "static-analysis",
+        "php",
+        "cli-tool"
+    ],
+    "homepage": "https://github.com/frodeborli/fubber",
+    "support": {
+        "issues": "https://github.com/frodeborli/fubber/issues"
+    },
+    "authors": [
+        {
+            "name": "Frode Borli"
+        }
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "bin": [
+        "bin/fubber",
+        "bin/fubber-php"
+    ],
+    "autoload": {
+        "psr-4": {
+            "FubberTool\\": "src/"
+        }
+    }
+}

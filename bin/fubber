@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+# Fubber - Multi-language codebase inspection tool
+#
+# This dispatcher currently delegates all commands to fubber-php.
+# In the future, it will detect the project language and delegate to:
+#   - fubber-php for PHP projects
+#   - fubber-python for Python projects
+#   - fubber-js for JavaScript/TypeScript projects
+#   - etc.
+
+# Find the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# For now, just delegate to fubber-php
+exec "${SCRIPT_DIR}/fubber-php" "$@"

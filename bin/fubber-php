@@ -1,0 +1,1933 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * Fubber - PHP Codebase Inspection Tool
+ *
+ * Command-line tool for browsing PHP documentation using reflection.
+ * Works with any PHP codebase - framework-agnostic.
+ *
+ * Features:
+ *   - Entity lookup: namespaces, classes, methods, properties, constants
+ *   - Search: pattern-based search on fully qualified entity names
+ *   - Relationship queries: implements, extends, uses traits
+ *   - Type queries: find methods accepting/returning specific types
+ *   - Attribute queries: find usage of PHP 8 attributes
+ *
+ * Future enhancements:
+ *   - FTS5 full-text search: Index docblocks and signatures into SQLite
+ *     with FTS5, enabling boolean queries like "auth AND user NOT password"
+ *
+ * Usage:
+ *   fubber <target>
+ *   fubber search <pattern>
+ *   fubber implements <interface>
+ *
+ * Examples:
+ *   fubber App\\Models                    # Show namespace overview
+ *   fubber App\\Models\\User              # Show class documentation
+ *   fubber search Router                  # Search for "Router"
+ *   fubber implements CacheInterface      # Find all implementations
+ *   fubber accepts Request                # Find methods accepting Request
+ */
+
+// Find and load Composer autoloader
+// Try multiple strategies:
+// 1. Current working directory (when inspecting a project)
+// 2. Script location (when installed as vendor package)
+// 3. Standalone development location
+
+$autoloadPaths = [];
+
+// Strategy 1: Search upward from current directory for vendor/autoload.php
+$dir = getcwd();
+while ($dir !== '/') {
+    $autoloadPaths[] = $dir . '/vendor/autoload.php';
+    $dir = dirname($dir);
+}
+
+// Strategy 2: Installed as vendor package
+$autoloadPaths[] = __DIR__ . '/../../../autoload.php';
+
+// Strategy 3: Standalone development
+$autoloadPaths[] = __DIR__ . '/../vendor/autoload.php';
+
+$autoloader = null;
+$composerDir = null;
+foreach ($autoloadPaths as $path) {
+    if (file_exists($path)) {
+        $autoloader = require $path;
+        $composerDir = dirname($path) . '/composer';
+        break;
+    }
+}
+
+if (!$autoloader) {
+    fwrite(STDERR, "Error: Could not find Composer autoloader\n");
+    fwrite(STDERR, "Make sure you're in a PHP project directory with vendor/autoload.php\n");
+    exit(1);
+}
+
+if (!is_dir($composerDir)) {
+    fwrite(STDERR, "Error: Could not find composer directory\n");
+    exit(1);
+}
+
+// Parse command-line arguments
+$command = $argv[1] ?? '';
+
+if (empty($command) || $command === '--help' || $command === '-h') {
+    showHelp();
+    exit(0);
+}
+
+// Check for relationship/type-based commands
+$relationshipCommands = ['implements', 'extends', 'uses', 'accepts', 'returns', 'compatible', 'attributes'];
+if (in_array($command, $relationshipCommands, true)) {
+    $targetType = $argv[2] ?? '';
+    if (empty($targetType)) {
+        fwrite(STDERR, "Error: Type/class name required\n");
+        fwrite(STDERR, "Usage: fubber {$command} <type>\n");
+        exit(1);
+    }
+
+    switch ($command) {
+        case 'implements':
+            findImplementations($targetType);
+            break;
+        case 'extends':
+            findSubclasses($targetType);
+            break;
+        case 'uses':
+            findTraitUsers($targetType);
+            break;
+        case 'accepts':
+            findMethodsAccepting($targetType);
+            break;
+        case 'returns':
+            findMethodsReturning($targetType);
+            break;
+        case 'compatible':
+            checkCompatibility($targetType);
+            break;
+        case 'attributes':
+            findAttributeUsers($targetType);
+            break;
+    }
+    exit(0);
+}
+
+// Check if this is a search command
+if ($command === 'search') {
+    // Check for flags
+    $caseInsensitive = false;
+    $pattern = '';
+
+    for ($i = 2; $i < count($argv); $i++) {
+        if ($argv[$i] === '-i' || $argv[$i] === '--ignore-case') {
+            $caseInsensitive = true;
+        } elseif (empty($pattern)) {
+            $pattern = $argv[$i];
+        }
+    }
+
+    if (empty($pattern)) {
+        fwrite(STDERR, "Error: Search pattern required\n");
+        fwrite(STDERR, "Usage: fubber search [-i] <pattern>\n");
+        fwrite(STDERR, "Options:\n");
+        fwrite(STDERR, "  -i, --ignore-case    Case-insensitive search\n");
+        fwrite(STDERR, "Examples:\n");
+        fwrite(STDERR, "  fubber search Router         # Case-sensitive substring search\n");
+        fwrite(STDERR, "  fubber search -i router      # Case-insensitive search\n");
+        fwrite(STDERR, "  fubber search '/.*Router$/'  # Regex search (use / delimiters)\n");
+        exit(1);
+    }
+
+    searchEntities($pattern, $caseInsensitive);
+    exit(0);
+}
+
+// Regular target lookup
+$target = $command;
+
+// Normalize the target (handle different input formats)
+$target = ltrim($target, '\\');
+
+// Check if target is a class member (ClassName::methodName, ClassName::propertyName, ClassName::CONSTANT)
+if (str_contains($target, '::')) {
+    [$className, $memberName] = explode('::', $target, 2);
+    $className = ltrim($className, '\\');
+    $memberName = ltrim($memberName, '$'); // Allow both ::property and ::$property
+
+    // Try to load the class
+    if (!class_exists($className, true) && !interface_exists($className, true) && !trait_exists($className, true)) {
+        discoverInNamespace($className);
+    }
+
+    if (class_exists($className) || interface_exists($className) || trait_exists($className)) {
+        $reflection = new ReflectionClass($className);
+
+        // Try method first
+        if ($reflection->hasMethod($memberName)) {
+            showMethodDocumentation($className, $memberName);
+            exit(0);
+        }
+
+        // Try property
+        if ($reflection->hasProperty($memberName)) {
+            showPropertyDocumentation($className, $memberName);
+            exit(0);
+        }
+
+        // Try constant
+        if ($reflection->hasConstant($memberName)) {
+            showConstantDocumentation($className, $memberName);
+            exit(0);
+        }
+
+        fwrite(STDERR, "Error: Member '{$memberName}' not found in class '{$className}'\n");
+        exit(1);
+    } else {
+        fwrite(STDERR, "Error: Class '{$className}' not found\n");
+        if (!str_contains($className, '\\')) {
+            fwrite(STDERR, "\nTip: If looking for a namespaced entity, remember to escape backslashes:\n");
+            fwrite(STDERR, "  fubber \"App\\\\SomeClass\"  or  fubber App\\\\\\\\SomeClass\n");
+        }
+        exit(1);
+    }
+}
+
+// Try to determine what type of entity this is and display documentation
+try {
+    // First try to discover everything in case it's a namespace
+    discoverInNamespace($target);
+
+    // Check priority: class/interface/trait > namespace > function (case-sensitive)
+    // This ensures mini\Cache finds the namespace, not mini\cache() function
+
+    if (class_exists($target, false) || interface_exists($target, false) || trait_exists($target, false)) {
+        showClassDocumentation($target);
+    } elseif (isNamespace($target)) {
+        // Namespace check BEFORE function check (namespaces are case-sensitive in practice)
+        showNamespaceDocumentation($target);
+    } elseif (function_exists($target)) {
+        // For functions, verify case-sensitive match to avoid mini\Cache matching mini\cache()
+        $allFunctions = get_defined_functions()['user'] ?? [];
+        $exactMatch = in_array($target, $allFunctions, true);
+
+        if ($exactMatch) {
+            showFunctionDocumentation($target);
+        } elseif (isNamespace($target)) {
+            // Still might be a namespace even if function_exists returned true
+            showNamespaceDocumentation($target);
+        } else {
+            // Case mismatch - try to find the correct case
+            $lowerTarget = strtolower($target);
+            foreach ($allFunctions as $func) {
+                if (strtolower($func) === $lowerTarget) {
+                    fwrite(STDERR, "Error: '{$target}' not found. Did you mean '{$func}'?\n");
+                    exit(1);
+                }
+            }
+
+            fwrite(STDERR, "Error: '{$target}' not found\n");
+            fwrite(STDERR, "Make sure the entity exists and can be autoloaded.\n");
+            if (!str_contains($target, '\\')) {
+                fwrite(STDERR, "\nTip: If looking for a namespaced entity, remember to escape backslashes:\n");
+                fwrite(STDERR, "  fubber \"App\\\\SomeClass\"  or  fubber App\\\\\\\\SomeClass\n");
+            }
+            exit(1);
+        }
+    } else {
+        // Not found - try parent namespace for functions
+        $parts = explode('\\', $target);
+        $namespace = implode('\\', array_slice($parts, 0, -1));
+        if ($namespace) {
+            discoverInNamespace($namespace);
+
+            if (class_exists($target) || interface_exists($target) || trait_exists($target)) {
+                showClassDocumentation($target);
+            } elseif (function_exists($target)) {
+                // Verify case-sensitive match
+                $allFunctions = get_defined_functions()['user'] ?? [];
+                if (in_array($target, $allFunctions, true)) {
+                    showFunctionDocumentation($target);
+                } else {
+                    fwrite(STDERR, "Error: '{$target}' not found\n");
+                    fwrite(STDERR, "Make sure the entity exists and can be autoloaded.\n");
+                    if (!str_contains($target, '\\')) {
+                        fwrite(STDERR, "\nTip: If looking for a namespaced entity, remember to escape backslashes:\n");
+                        fwrite(STDERR, "  mini docs \"mini\\SomeClass\"  or  mini docs mini\\\\SomeClass\n");
+                    }
+                    exit(1);
+                }
+            } else {
+                fwrite(STDERR, "Error: '{$target}' not found\n");
+                fwrite(STDERR, "Make sure the entity exists and can be autoloaded.\n");
+                if (!str_contains($target, '\\')) {
+                    fwrite(STDERR, "\nTip: If looking for a namespaced entity, remember to escape backslashes:\n");
+                    fwrite(STDERR, "  mini docs \"mini\\SomeClass\"  or  mini docs mini\\\\SomeClass\n");
+                }
+                exit(1);
+            }
+        } else {
+            fwrite(STDERR, "Error: '{$target}' not found\n");
+            fwrite(STDERR, "Make sure the entity exists and can be autoloaded.\n");
+            if (!str_contains($target, '\\')) {
+                fwrite(STDERR, "\nTip: If looking for a namespaced entity, remember to escape backslashes:\n");
+                fwrite(STDERR, "  fubber \"App\\\\SomeClass\"  or  fubber App\\\\\\\\SomeClass\n");
+            }
+            exit(1);
+        }
+    }
+} catch (Exception $e) {
+    fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
+    exit(1);
+}
+
+exit(0);
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Convert absolute path to relative path based on cwd
+ */
+function relativePath(string $absolutePath): string {
+    $cwd = getcwd();
+    if ($cwd && str_starts_with($absolutePath, $cwd . '/')) {
+        return substr($absolutePath, strlen($cwd) + 1);
+    }
+    return $absolutePath;
+}
+
+/**
+ * Find all classes implementing an interface
+ */
+function findImplementations(string $interface): void {
+    autoloadAll();
+
+    $interface = ltrim($interface, '\\');
+
+    if (!interface_exists($interface)) {
+        fwrite(STDERR, "Error: Interface '{$interface}' not found\n");
+        exit(1);
+    }
+
+    $implementations = [];
+    foreach (get_declared_classes() as $class) {
+        $reflection = new ReflectionClass($class);
+        if ($reflection->implementsInterface($interface)) {
+            $implementations[] = $class;
+        }
+    }
+
+    if (empty($implementations)) {
+        echo "No implementations found for interface: {$interface}\n";
+        exit(0);
+    }
+
+    sort($implementations);
+    echo "implementations of {$interface}: " . count($implementations) . " classes\n\n";
+    foreach ($implementations as $class) {
+        $reflection = new ReflectionClass($class);
+        $summary = minidocs_getDocSummary($reflection);
+        echo "  {$class}";
+        if ($summary) {
+            echo " // {$summary}";
+        }
+        echo "\n";
+    }
+}
+
+/**
+ * Find all classes extending a base class
+ */
+function findSubclasses(string $baseClass): void {
+    autoloadAll();
+
+    $baseClass = ltrim($baseClass, '\\');
+
+    if (!class_exists($baseClass)) {
+        fwrite(STDERR, "Error: Class '{$baseClass}' not found\n");
+        exit(1);
+    }
+
+    $subclasses = [];
+    foreach (get_declared_classes() as $class) {
+        if ($class === $baseClass) continue;
+        if (is_subclass_of($class, $baseClass)) {
+            $subclasses[] = $class;
+        }
+    }
+
+    if (empty($subclasses)) {
+        echo "No subclasses found for class: {$baseClass}\n";
+        exit(0);
+    }
+
+    sort($subclasses);
+    echo "subclasses of {$baseClass}: " . count($subclasses) . " classes\n\n";
+    foreach ($subclasses as $class) {
+        $reflection = new ReflectionClass($class);
+        $summary = minidocs_getDocSummary($reflection);
+        echo "  {$class}";
+        if ($summary) {
+            echo " // {$summary}";
+        }
+        echo "\n";
+    }
+}
+
+/**
+ * Find all classes using a trait
+ */
+function findTraitUsers(string $trait): void {
+    autoloadAll();
+
+    $trait = ltrim($trait, '\\');
+
+    if (!trait_exists($trait)) {
+        fwrite(STDERR, "Error: Trait '{$trait}' not found\n");
+        exit(1);
+    }
+
+    $users = [];
+    foreach (get_declared_classes() as $class) {
+        $reflection = new ReflectionClass($class);
+        $traits = $reflection->getTraitNames();
+        if (in_array($trait, $traits, true)) {
+            $users[] = $class;
+        }
+    }
+
+    if (empty($users)) {
+        echo "No classes found using trait: {$trait}\n";
+        exit(0);
+    }
+
+    sort($users);
+    echo "classes using {$trait}: " . count($users) . " classes\n\n";
+    foreach ($users as $class) {
+        $reflection = new ReflectionClass($class);
+        $summary = minidocs_getDocSummary($reflection);
+        echo "  {$class}";
+        if ($summary) {
+            echo " // {$summary}";
+        }
+        echo "\n";
+    }
+}
+
+/**
+ * Find all methods/functions accepting a specific type
+ */
+function findMethodsAccepting(string $type): void {
+    autoloadAll();
+
+    $type = ltrim($type, '\\');
+    $results = [];
+
+    // Search functions
+    foreach (get_defined_functions()['user'] ?? [] as $func) {
+        $reflection = new ReflectionFunction($func);
+        foreach ($reflection->getParameters() as $param) {
+            $paramType = $param->getType();
+            if ($paramType && typeMatches($paramType, $type)) {
+                $returnType = $reflection->getReturnType() ? formatType($reflection->getReturnType()) : 'mixed';
+                $params = formatParameters($reflection);
+                $results[] = [
+                    'type' => 'function',
+                    'name' => $func,
+                    'signature' => "{$func}({$params}): {$returnType}",
+                    'summary' => minidocs_getDocSummary($reflection)
+                ];
+                break;
+            }
+        }
+    }
+
+    // Search methods
+    foreach (array_merge(get_declared_classes(), get_declared_interfaces(), get_declared_traits()) as $class) {
+        $reflection = new ReflectionClass($class);
+        foreach ($reflection->getMethods() as $method) {
+            foreach ($method->getParameters() as $param) {
+                $paramType = $param->getType();
+                if ($paramType && typeMatches($paramType, $type)) {
+                    $methodName = $class . '::' . $method->getName();
+                    $returnType = $method->getReturnType() ? formatType($method->getReturnType()) : 'mixed';
+                    $params = formatParameters($method);
+                    $results[] = [
+                        'type' => 'method',
+                        'name' => $methodName,
+                        'signature' => "{$methodName}({$params}): {$returnType}",
+                        'summary' => minidocs_getDocSummary($method)
+                    ];
+                    break;
+                }
+            }
+        }
+    }
+
+    if (empty($results)) {
+        echo "No methods or functions found accepting type: {$type}\n";
+        exit(0);
+    }
+
+    echo "accepts {$type}: " . count($results) . " matches\n\n";
+
+    $functions = array_filter($results, fn($r) => $r['type'] === 'function');
+    $methods = array_filter($results, fn($r) => $r['type'] === 'method');
+
+    if (!empty($functions)) {
+        echo "functions:\n";
+        foreach ($functions as $item) {
+            echo "  {$item['signature']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    if (!empty($methods)) {
+        echo "methods:\n";
+        foreach ($methods as $item) {
+            echo "  {$item['signature']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+    }
+}
+
+/**
+ * Find all methods/functions returning a specific type
+ */
+function findMethodsReturning(string $type): void {
+    autoloadAll();
+
+    $type = ltrim($type, '\\');
+    $results = [];
+
+    // Search functions
+    foreach (get_defined_functions()['user'] ?? [] as $func) {
+        $reflection = new ReflectionFunction($func);
+        $returnType = $reflection->getReturnType();
+        if ($returnType && typeMatches($returnType, $type)) {
+            $returnTypeStr = formatType($returnType);
+            $params = formatParameters($reflection);
+            $results[] = [
+                'type' => 'function',
+                'name' => $func,
+                'signature' => "{$func}({$params}): {$returnTypeStr}",
+                'summary' => minidocs_getDocSummary($reflection)
+            ];
+        }
+    }
+
+    // Search methods
+    foreach (array_merge(get_declared_classes(), get_declared_interfaces(), get_declared_traits()) as $class) {
+        $reflection = new ReflectionClass($class);
+        foreach ($reflection->getMethods() as $method) {
+            $returnType = $method->getReturnType();
+            if ($returnType && typeMatches($returnType, $type)) {
+                $methodName = $class . '::' . $method->getName();
+                $returnTypeStr = formatType($returnType);
+                $params = formatParameters($method);
+                $results[] = [
+                    'type' => 'method',
+                    'name' => $methodName,
+                    'signature' => "{$methodName}({$params}): {$returnTypeStr}",
+                    'summary' => minidocs_getDocSummary($method)
+                ];
+            }
+        }
+    }
+
+    if (empty($results)) {
+        echo "No methods or functions found returning type: {$type}\n";
+        exit(0);
+    }
+
+    echo "returns {$type}: " . count($results) . " matches\n\n";
+
+    $functions = array_filter($results, fn($r) => $r['type'] === 'function');
+    $methods = array_filter($results, fn($r) => $r['type'] === 'method');
+
+    if (!empty($functions)) {
+        echo "functions:\n";
+        foreach ($functions as $item) {
+            echo "  {$item['signature']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    if (!empty($methods)) {
+        echo "methods:\n";
+        foreach ($methods as $item) {
+            echo "  {$item['signature']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+    }
+}
+
+/**
+ * Check if a class/interface is compatible with another (implements all methods)
+ */
+function checkCompatibility(string $interface): void {
+    autoloadAll();
+
+    $interface = ltrim($interface, '\\');
+
+    if (!interface_exists($interface) && !class_exists($interface)) {
+        fwrite(STDERR, "Error: Interface or class '{$interface}' not found\n");
+        exit(1);
+    }
+
+    $reflection = new ReflectionClass($interface);
+    $requiredMethods = $reflection->getMethods();
+
+    echo "compatibility check for {$interface}\n";
+    echo "required methods: " . count($requiredMethods) . "\n\n";
+
+    foreach ($requiredMethods as $method) {
+        $params = formatParameters($method);
+        $returnType = $method->getReturnType() ? formatType($method->getReturnType()) : 'mixed';
+        echo "  {$method->getName()}({$params}): {$returnType}\n";
+    }
+
+    echo "\n";
+
+    // Find all implementations
+    $implementations = [];
+    foreach (get_declared_classes() as $class) {
+        $classReflection = new ReflectionClass($class);
+        if ($classReflection->implementsInterface($interface) || is_subclass_of($class, $interface)) {
+            $implementations[] = $class;
+        }
+    }
+
+    if (!empty($implementations)) {
+        echo "implementations: " . count($implementations) . " classes\n\n";
+        foreach ($implementations as $class) {
+            $classReflection = new ReflectionClass($class);
+            $summary = minidocs_getDocSummary($classReflection);
+            echo "  {$class}";
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+    } else {
+        echo "No implementations found.\n";
+    }
+}
+
+/**
+ * Find all classes/methods using a specific attribute
+ */
+function findAttributeUsers(string $attribute): void {
+    autoloadAll();
+
+    $attribute = ltrim($attribute, '\\');
+
+    // Try to load the attribute class
+    if (!class_exists($attribute)) {
+        // Maybe it's a short name, try common namespaces
+        $tried = [$attribute];
+        foreach (['Attribute', '\\Attribute', 'Attributes\\'] as $prefix) {
+            $fullName = $prefix . $attribute;
+            if (class_exists($fullName)) {
+                $attribute = $fullName;
+                break;
+            }
+            $tried[] = $fullName;
+        }
+
+        if (!class_exists($attribute)) {
+            fwrite(STDERR, "Error: Attribute class '{$attribute}' not found\n");
+            fwrite(STDERR, "Tried: " . implode(', ', $tried) . "\n");
+            exit(1);
+        }
+    }
+
+    $results = [
+        'classes' => [],
+        'methods' => [],
+        'properties' => [],
+        'constants' => [],
+    ];
+
+    // Search classes
+    foreach (array_merge(get_declared_classes(), get_declared_interfaces(), get_declared_traits()) as $class) {
+        $reflection = new ReflectionClass($class);
+
+        // Check class attributes
+        $attrs = $reflection->getAttributes($attribute);
+        if (!empty($attrs)) {
+            $results['classes'][] = [
+                'name' => $class,
+                'summary' => minidocs_getDocSummary($reflection)
+            ];
+        }
+
+        // Check method attributes
+        foreach ($reflection->getMethods() as $method) {
+            $attrs = $method->getAttributes($attribute);
+            if (!empty($attrs)) {
+                $methodName = $class . '::' . $method->getName();
+                $returnType = $method->getReturnType() ? formatType($method->getReturnType()) : 'mixed';
+                $params = formatParameters($method);
+                $results['methods'][] = [
+                    'name' => $methodName,
+                    'signature' => "{$methodName}({$params}): {$returnType}",
+                    'summary' => minidocs_getDocSummary($method)
+                ];
+            }
+        }
+
+        // Check property attributes
+        foreach ($reflection->getProperties() as $property) {
+            $attrs = $property->getAttributes($attribute);
+            if (!empty($attrs)) {
+                $propertyName = $class . '::$' . $property->getName();
+                $propType = $property->getType() ? formatType($property->getType()) : 'mixed';
+                $results['properties'][] = [
+                    'name' => $propertyName,
+                    'signature' => "{$propertyName}: {$propType}",
+                    'summary' => minidocs_getDocSummary($property)
+                ];
+            }
+        }
+
+        // Check constant attributes
+        foreach ($reflection->getReflectionConstants() as $constant) {
+            $attrs = $constant->getAttributes($attribute);
+            if (!empty($attrs)) {
+                $constantName = $class . '::' . $constant->getName();
+                $results['constants'][] = [
+                    'name' => $constantName,
+                    'summary' => ''
+                ];
+            }
+        }
+    }
+
+    $total = count($results['classes']) + count($results['methods']) +
+             count($results['properties']) + count($results['constants']);
+
+    if ($total === 0) {
+        echo "No uses found for attribute: {$attribute}\n";
+        exit(0);
+    }
+
+    echo "attribute {$attribute}: {$total} uses\n\n";
+
+    if (!empty($results['classes'])) {
+        echo "classes:\n";
+        foreach ($results['classes'] as $item) {
+            echo "  {$item['name']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    if (!empty($results['methods'])) {
+        echo "methods:\n";
+        foreach ($results['methods'] as $item) {
+            echo "  {$item['signature']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    if (!empty($results['properties'])) {
+        echo "properties:\n";
+        foreach ($results['properties'] as $item) {
+            echo "  {$item['signature']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    if (!empty($results['constants'])) {
+        echo "constants:\n";
+        foreach ($results['constants'] as $item) {
+            echo "  {$item['name']}";
+            if ($item['summary']) {
+                echo " // {$item['summary']}";
+            }
+            echo "\n";
+        }
+    }
+}
+
+/**
+ * Check if a ReflectionType matches a given type name
+ */
+function typeMatches(ReflectionType $reflectionType, string $targetType): bool {
+    if ($reflectionType instanceof ReflectionNamedType) {
+        $typeName = $reflectionType->getName();
+        // Match both short name and fully qualified name
+        return $typeName === $targetType ||
+               ltrim($typeName, '\\') === ltrim($targetType, '\\') ||
+               basename(str_replace('\\', '/', $typeName)) === $targetType;
+    } elseif ($reflectionType instanceof ReflectionUnionType) {
+        foreach ($reflectionType->getTypes() as $type) {
+            if (typeMatches($type, $targetType)) {
+                return true;
+            }
+        }
+    } elseif ($reflectionType instanceof ReflectionIntersectionType) {
+        foreach ($reflectionType->getTypes() as $type) {
+            if (typeMatches($type, $targetType)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Search for entities matching a pattern
+ *
+ * Searches:
+ *   - Entity names (classes, interfaces, traits, enums, functions)
+ *   - Method names and signatures (parameters, return types)
+ *   - Property names and types
+ *   - Constant names
+ *
+ * Future enhancement: FTS5-based full-text search through documentation content
+ */
+function searchEntities(string $pattern, bool $caseInsensitive = false): void {
+    // Load all classes first
+    autoloadAll();
+
+    // Determine if pattern is regex (enclosed in /) or substring
+    $isRegex = str_starts_with($pattern, '/') && str_ends_with($pattern, '/');
+
+    if ($isRegex) {
+        $regex = $pattern;
+    } else {
+        // Convert substring to regex (case-sensitive by default)
+        $flags = $caseInsensitive ? 'i' : '';
+        $regex = '/' . preg_quote($pattern, '/') . '/' . $flags;
+    }
+
+    // Get all entities
+    $allClasses = get_declared_classes();
+    $allInterfaces = get_declared_interfaces();
+    $allTraits = get_declared_traits();
+    $allFunctions = get_defined_functions()['user'] ?? [];
+
+    $results = [
+        'functions' => [],
+        'methods' => [],
+        'properties' => [],
+        'constants' => [],
+        'classes' => [],
+        'interfaces' => [],
+        'traits' => [],
+        'enums' => [],
+    ];
+
+    // Search functions - build full signature line
+    foreach ($allFunctions as $func) {
+        $reflection = new ReflectionFunction($func);
+        $returnType = $reflection->getReturnType() ? formatType($reflection->getReturnType()) : 'mixed';
+        $params = formatParameters($reflection);
+        $signature = "{$func}({$params}): {$returnType}";
+
+        // Match against complete signature line
+        if (preg_match($regex, $signature)) {
+            $summary = minidocs_getDocSummary($reflection);
+            $results['functions'][] = [
+                'name' => $func,
+                'signature' => $signature,
+                'summary' => $summary
+            ];
+        }
+    }
+
+    // Search classes, interfaces, traits, enums (and their members)
+    foreach (array_merge($allClasses, $allInterfaces, $allTraits) as $item) {
+        $reflection = new ReflectionClass($item);
+        $summary = minidocs_getDocSummary($reflection);
+
+        // Build class/interface/trait/enum line
+        $classLine = '';
+        if ($reflection->isEnum()) {
+            $cases = $reflection->getConstants();
+            $caseNames = array_keys($cases);
+            $classLine = "enum {$item}";
+        } elseif ($reflection->isInterface()) {
+            $classLine = "interface {$item}";
+        } elseif ($reflection->isTrait()) {
+            $classLine = "trait {$item}";
+        } else {
+            $classLine = "class {$item}";
+        }
+
+        // Match against class line
+        if (preg_match($regex, $classLine)) {
+            if ($reflection->isEnum()) {
+                $cases = $reflection->getConstants();
+                $caseNames = array_keys($cases);
+                $results['enums'][] = [
+                    'name' => $item,
+                    'cases' => $caseNames,
+                    'summary' => $summary
+                ];
+            } elseif ($reflection->isInterface()) {
+                $results['interfaces'][] = [
+                    'name' => $item,
+                    'summary' => $summary
+                ];
+            } elseif ($reflection->isTrait()) {
+                $results['traits'][] = [
+                    'name' => $item,
+                    'summary' => $summary
+                ];
+            } else {
+                $results['classes'][] = [
+                    'name' => $item,
+                    'summary' => $summary
+                ];
+            }
+        }
+
+        // Search methods - build full signature line
+        foreach ($reflection->getMethods() as $method) {
+            $methodName = $item . '::' . $method->getName();
+            $returnType = $method->getReturnType() ? formatType($method->getReturnType()) : 'mixed';
+            $params = formatParameters($method);
+            $signature = "{$methodName}({$params}): {$returnType}";
+
+            // Match against complete signature line
+            if (preg_match($regex, $signature)) {
+                $methodSummary = minidocs_getDocSummary($method);
+                $results['methods'][] = [
+                    'name' => $methodName,
+                    'signature' => $signature,
+                    'summary' => $methodSummary
+                ];
+            }
+        }
+
+        // Search properties - build full signature line
+        foreach ($reflection->getProperties() as $property) {
+            $propertyName = $item . '::$' . $property->getName();
+            $propType = $property->getType() ? formatType($property->getType()) : 'mixed';
+            $signature = "{$propertyName}: {$propType}";
+
+            // Match against complete signature line
+            if (preg_match($regex, $signature)) {
+                $propertySummary = minidocs_getDocSummary($property);
+                $results['properties'][] = [
+                    'name' => $propertyName,
+                    'signature' => $signature,
+                    'summary' => $propertySummary
+                ];
+            }
+        }
+
+        // Search constants - build full signature line with value
+        foreach ($reflection->getReflectionConstants() as $constant) {
+            $constantName = $item . '::' . $constant->getName();
+            $constantValue = $constant->getValue();
+            $valueStr = var_export($constantValue, true);
+            // Keep value representation short for readability
+            if (strlen($valueStr) > 50) {
+                $valueStr = substr($valueStr, 0, 47) . '...';
+            }
+            $signature = "{$constantName} = {$valueStr}";
+
+            // Match against complete signature line
+            if (preg_match($regex, $signature)) {
+                try {
+                    $constantSummary = minidocs_getDocSummary($constant);
+                } catch (Throwable $e) {
+                    $constantSummary = '';
+                }
+                $results['constants'][] = [
+                    'name' => $constantName,
+                    'signature' => $signature,
+                    'summary' => $constantSummary
+                ];
+            }
+        }
+    }
+
+    // Count total results
+    $total = count($results['functions']) + count($results['methods']) +
+             count($results['properties']) + count($results['constants']) +
+             count($results['classes']) + count($results['interfaces']) +
+             count($results['traits']) + count($results['enums']);
+
+    if ($total === 0) {
+        echo "No matches found for pattern: {$pattern}\n";
+        exit(0);
+    }
+
+    echo "search results: {$total} matches\n";
+    if ($isRegex) {
+        echo "pattern: {$pattern}\n\n";
+    } else {
+        $caseDesc = $caseInsensitive ? ' (case-insensitive)' : '';
+        echo "pattern: {$pattern}{$caseDesc}\n\n";
+    }
+
+    // Display functions
+    if (!empty($results['functions'])) {
+        echo "functions:\n";
+        foreach ($results['functions'] as $func) {
+            echo "  {$func['signature']}";
+            if ($func['summary']) {
+                echo " // {$func['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display methods
+    if (!empty($results['methods'])) {
+        echo "methods:\n";
+        foreach ($results['methods'] as $method) {
+            echo "  {$method['signature']}";
+            if ($method['summary']) {
+                echo " // {$method['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display properties
+    if (!empty($results['properties'])) {
+        echo "properties:\n";
+        foreach ($results['properties'] as $property) {
+            echo "  {$property['signature']}";
+            if ($property['summary']) {
+                echo " // {$property['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display constants
+    if (!empty($results['constants'])) {
+        echo "constants:\n";
+        foreach ($results['constants'] as $constant) {
+            echo "  {$constant['signature']}";
+            if ($constant['summary']) {
+                echo " // {$constant['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display enums
+    if (!empty($results['enums'])) {
+        echo "enums:\n";
+        foreach ($results['enums'] as $enum) {
+            echo "  {$enum['name']}";
+            if (!empty($enum['cases'])) {
+                echo " (" . implode(', ', $enum['cases']) . ")";
+            }
+            if ($enum['summary']) {
+                echo " // {$enum['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display interfaces
+    if (!empty($results['interfaces'])) {
+        echo "interfaces:\n";
+        foreach ($results['interfaces'] as $interface) {
+            echo "  {$interface['name']}";
+            if ($interface['summary']) {
+                echo " // {$interface['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display traits
+    if (!empty($results['traits'])) {
+        echo "traits:\n";
+        foreach ($results['traits'] as $trait) {
+            echo "  {$trait['name']}";
+            if ($trait['summary']) {
+                echo " // {$trait['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display classes
+    if (!empty($results['classes'])) {
+        echo "classes:\n";
+        foreach ($results['classes'] as $class) {
+            echo "  {$class['name']}";
+            if ($class['summary']) {
+                echo " // {$class['summary']}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+}
+
+/**
+ * Show help message
+ */
+function showHelp(): void {
+    echo <<<HELP
+Fubber - PHP Codebase Inspection Tool
+
+Usage:
+  fubber <target>                       # Show documentation for specific entity
+  fubber search [-i] <pattern>          # Search names and signatures
+  fubber implements <interface>         # Find all implementations
+  fubber extends <class>                # Find all subclasses
+  fubber uses <trait>                   # Find all trait users
+  fubber accepts <type>                 # Find methods accepting a type
+  fubber returns <type>                 # Find methods returning a type
+  fubber compatible <interface>         # Check interface compatibility
+  fubber attributes <attribute>         # Find attribute usage
+
+Lookup Examples:
+  fubber App\\Models                                    # Show namespace overview
+  fubber "App\\Models\\User"                            # Show class documentation
+  fubber "App\\Models\\User::save"                      # Show method documentation
+  fubber "App\\Helpers\\formatDate"                     # Show function documentation
+
+Search Examples (case-sensitive by default):
+  fubber search Router                                  # Find "Router" in names/signatures
+  fubber search -i router                               # Case-insensitive search
+  fubber search '\$request'                             # Find methods with \$request parameter
+  fubber search '/^interface.*able$/'                   # Regex: interfaces ending with "able"
+
+Relationship Queries:
+  fubber implements CacheInterface                      # All classes implementing interface
+  fubber extends Repository                             # All subclasses of Repository
+  fubber accepts Request                                # Methods accepting Request type
+  fubber returns Response                               # Methods returning Response type
+  fubber compatible Psr\\Log\\LoggerInterface           # Show required methods + implementations
+  fubber attributes Route                               # Find all #[Route] attribute uses
+
+Note: Use quotes or double backslashes to escape namespace separators:
+  fubber "App\\SomeClass"  or  fubber App\\\\SomeClass
+
+HELP;
+}
+
+/**
+ * Check if a string represents a namespace
+ */
+function isNamespace(string $target): bool {
+    // A namespace exists if there are classes, interfaces, traits, or functions in it
+    $allClasses = array_merge(
+        get_declared_classes(),
+        get_declared_interfaces(),
+        get_declared_traits()
+    );
+
+    foreach ($allClasses as $class) {
+        if (str_starts_with($class, $target . '\\')) {
+            return true;
+        }
+    }
+
+    $allFunctions = get_defined_functions()['user'] ?? [];
+    foreach ($allFunctions as $func) {
+        if (str_starts_with($func, $target . '\\')) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Trigger autoload of all classes using Composer's metadata
+ * Based on efficient discovery algorithm
+ */
+function autoloadAll(): void {
+    global $composerDir;
+
+    static $alreadyLoaded = false;
+    if ($alreadyLoaded) {
+        return;
+    }
+    $alreadyLoaded = true;
+
+    $checked = [];
+    // Avoid triggering autoload of files that have already been loaded
+    $loadedFiles = array_fill_keys(get_included_files(), true);
+
+    $triggerAutoload = function(string $className) use (&$checked, &$loadedFiles) {
+        // Avoid checking twice for class existence
+        if (isset($checked[$className])) {
+            return;
+        }
+        $checked[$className] = true;
+
+        try {
+            class_exists($className);
+        } catch (Throwable $e) {
+            // Skip classes with fatal compatibility issues
+        }
+    };
+
+    // 1. Process classmap
+    if (file_exists($fn = $composerDir . '/autoload_classmap.php')) {
+        foreach (include($fn) as $className => $path) {
+            if (isset($loadedFiles[$path])) {
+                continue;
+            }
+            $loadedFiles[$path] = true;
+            $triggerAutoload($className);
+        }
+    }
+
+    // 2. Process PSR-4
+    if (file_exists($fn = $composerDir . '/autoload_psr4.php')) {
+        $psr4queue = [];
+        foreach (include($fn) as $ns => $dirs) {
+            $psr4queue[] = [$ns, $dirs];
+        }
+
+        while (!empty($psr4queue)) {
+            [$ns, $dirs] = array_shift($psr4queue);
+
+            foreach ($dirs as $dir) {
+                if (!is_dir($dir)) {
+                    continue;
+                }
+
+                foreach (glob($dir . '/*', GLOB_MARK) as $path) {
+                    if (str_ends_with($path, DIRECTORY_SEPARATOR)) {
+                        // Directory - add to queue
+                        $psr4queue[] = [$ns . basename($path) . '\\', [substr($path, 0, -1)]];
+                    } elseif (str_ends_with($path, '.php')) {
+                        // PHP file - trigger autoloader
+                        if (isset($loadedFiles[$path])) {
+                            continue;
+                        }
+                        $loadedFiles[$path] = true;
+                        $className = $ns . substr(basename($path), 0, -4);
+                        $triggerAutoload($className);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Discover all entities in a specific namespace
+ */
+function discoverInNamespace(string $namespace): void {
+    // Load all classes first
+    autoloadAll();
+
+    // Namespace-specific discovery is now just ensuring everything is loaded
+    // The actual filtering happens in showNamespaceDocumentation()
+}
+
+/**
+ * Show documentation for a namespace
+ */
+function showNamespaceDocumentation(string $namespace): void {
+    // Discover all entities in this namespace
+    discoverInNamespace($namespace);
+
+    echo "namespace: {$namespace}\n\n";
+
+    // Get all entities in this namespace (direct children only)
+    $allClasses = get_declared_classes();
+    $allInterfaces = get_declared_interfaces();
+    $allTraits = get_declared_traits();
+    $allFunctions = get_defined_functions()['user'] ?? [];
+
+    // Find direct children (no deeper nesting)
+    $classes = [];
+    $interfaces = [];
+    $traits = [];
+    $enums = [];
+    $functions = [];
+    $subNamespaces = [];
+
+    foreach (array_merge($allClasses, $allInterfaces, $allTraits) as $item) {
+        if (str_starts_with($item, $namespace . '\\')) {
+            $remainder = substr($item, strlen($namespace) + 1);
+            if (!str_contains($remainder, '\\')) {
+                // Direct child
+                $reflection = new ReflectionClass($item);
+                if ($reflection->isEnum()) {
+                    $enums[] = $item;
+                } elseif ($reflection->isInterface()) {
+                    $interfaces[] = $item;
+                } elseif ($reflection->isTrait()) {
+                    $traits[] = $item;
+                } else {
+                    $classes[] = $item;
+                }
+            } else {
+                // Sub-namespace
+                $subNs = explode('\\', $remainder)[0];
+                $subNamespaces[$subNs] = true;
+            }
+        }
+    }
+
+    foreach ($allFunctions as $func) {
+        if (str_starts_with($func, $namespace . '\\')) {
+            $remainder = substr($func, strlen($namespace) + 1);
+            if (!str_contains($remainder, '\\')) {
+                $functions[] = $func;
+            }
+        }
+    }
+
+    $subNamespaces = array_keys($subNamespaces);
+    sort($subNamespaces);
+    sort($classes);
+    sort($interfaces);
+    sort($traits);
+    sort($enums);
+    sort($functions);
+
+    // Display sub-namespaces
+    if (!empty($subNamespaces)) {
+        echo "sub namespaces:\n";
+        foreach ($subNamespaces as $subNs) {
+            echo "  {$subNs}\n";
+        }
+        echo "\n";
+    }
+
+    // Display functions
+    if (!empty($functions)) {
+        echo "functions:\n";
+        foreach ($functions as $func) {
+            $shortName = substr($func, strlen($namespace) + 1);
+            $reflection = new ReflectionFunction($func);
+            $returnType = $reflection->getReturnType() ? formatType($reflection->getReturnType()) : 'mixed';
+            $params = formatParameters($reflection);
+            $summary = minidocs_getDocSummary($reflection);
+
+            echo "  {$shortName}({$params}): {$returnType}";
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display enums
+    if (!empty($enums)) {
+        echo "enums:\n";
+        foreach ($enums as $enum) {
+            $shortName = substr($enum, strlen($namespace) + 1);
+            $reflection = new ReflectionClass($enum);
+            $summary = minidocs_getDocSummary($reflection);
+
+            // Get enum cases
+            $cases = $reflection->getConstants();
+            $caseNames = array_keys($cases);
+
+            echo "  {$shortName}";
+            if (!empty($caseNames)) {
+                echo " (" . implode(', ', $caseNames) . ")";
+            }
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display interfaces
+    if (!empty($interfaces)) {
+        echo "interfaces:\n";
+        foreach ($interfaces as $interface) {
+            $shortName = substr($interface, strlen($namespace) + 1);
+            $reflection = new ReflectionClass($interface);
+            $summary = minidocs_getDocSummary($reflection);
+            echo "  {$shortName}";
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display traits
+    if (!empty($traits)) {
+        echo "traits:\n";
+        foreach ($traits as $trait) {
+            $shortName = substr($trait, strlen($namespace) + 1);
+            $reflection = new ReflectionClass($trait);
+            $summary = minidocs_getDocSummary($reflection);
+            echo "  {$shortName}";
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    // Display classes
+    if (!empty($classes)) {
+        echo "classes:\n";
+        foreach ($classes as $class) {
+            $shortName = substr($class, strlen($namespace) + 1);
+            $reflection = new ReflectionClass($class);
+            $summary = minidocs_getDocSummary($reflection);
+            $modifiers = [];
+            if ($reflection->isAbstract()) $modifiers[] = 'abstract';
+            if ($reflection->isFinal()) $modifiers[] = 'final';
+
+            echo "  " . ($modifiers ? implode(' ', $modifiers) . ' ' : '') . "{$shortName}";
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+        echo "\n";
+    }
+
+    if (empty($subNamespaces) && empty($functions) && empty($enums) && empty($interfaces) && empty($traits) && empty($classes)) {
+        echo "No entities found in this namespace.\n";
+    }
+}
+
+/**
+ * Show documentation for a class, interface, trait, or enum
+ */
+function showClassDocumentation(string $className): void {
+    $reflection = new ReflectionClass($className);
+
+    $type = $reflection->isEnum() ? 'enum' : ($reflection->isInterface() ? 'interface' : ($reflection->isTrait() ? 'trait' : 'class'));
+    $modifiers = [];
+    if ($reflection->isFinal()) $modifiers[] = 'final';
+    if ($reflection->isAbstract()) $modifiers[] = 'abstract';
+    if ($reflection->isReadOnly()) $modifiers[] = 'readonly';
+
+    echo ($modifiers ? implode(' ', $modifiers) . ' ' : '') . "{$type} {$className}\n";
+
+    // Show documentation
+    $docSummary = minidocs_getDocSummary($reflection);
+    if ($docSummary) {
+        echo "  {$docSummary}\n";
+    }
+    $docDescription = minidocs_getDocDescription($reflection);
+    if ($docDescription) {
+        echo "  {$docDescription}\n";
+    }
+
+    // Show inheritance
+    $parent = $reflection->getParentClass();
+    if ($parent) {
+        echo "extends: {$parent->getName()}\n";
+    }
+
+    $interfaces = $reflection->getInterfaces();
+    if (!empty($interfaces)) {
+        echo "implements: " . implode(', ', array_map(fn($i) => $i->getName(), $interfaces)) . "\n";
+    }
+
+    $traits = $reflection->getTraits();
+    if (!empty($traits)) {
+        echo "uses: " . implode(', ', array_map(fn($t) => $t->getName(), $traits)) . "\n";
+    }
+
+    // Show enum cases
+    if ($reflection->isEnum()) {
+        $cases = $reflection->getConstants();
+        if (!empty($cases)) {
+            echo "\ncases:\n";
+            foreach ($cases as $name => $value) {
+                echo "  {$name}";
+                if (is_object($value) && property_exists($value, 'value')) {
+                    echo " = " . var_export($value->value, true);
+                }
+                echo "\n";
+            }
+        }
+    } else {
+        // Show constants
+        $constants = $reflection->getConstants();
+        if (!empty($constants)) {
+            echo "\nconstants:\n";
+            foreach ($constants as $name => $value) {
+                echo "  {$name} = " . var_export($value, true) . "\n";
+            }
+        }
+    }
+
+    // Show properties
+    $properties = $reflection->getProperties();
+    if (!empty($properties)) {
+        echo "\nproperties:\n";
+        foreach ($properties as $property) {
+            $vis = $property->isPublic() ? 'public' : ($property->isProtected() ? 'protected' : 'private');
+            $static = $property->isStatic() ? 'static ' : '';
+            $readonly = $property->isReadOnly() ? 'readonly ' : '';
+            $type = $property->getType() ? formatType($property->getType()) : 'mixed';
+
+            echo "  {$vis} {$static}{$readonly}{$type} \${$property->getName()}";
+
+            $summary = minidocs_getDocSummary($property);
+            if ($summary) {
+                echo " // {$summary}";
+            }
+            echo "\n";
+        }
+    }
+
+    // Show methods
+    $methods = $reflection->getMethods();
+    if (!empty($methods)) {
+        echo "\nmethods:\n";
+        foreach ($methods as $method) {
+            $vis = $method->isPublic() ? 'public' : ($method->isProtected() ? 'protected' : 'private');
+            $static = $method->isStatic() ? 'static ' : '';
+            $abstract = $method->isAbstract() ? 'abstract ' : '';
+            $final = $method->isFinal() ? 'final ' : '';
+
+            $returnType = $method->getReturnType() ? formatType($method->getReturnType()) : 'mixed';
+            $params = formatParameters($method);
+
+            echo "  {$vis} {$abstract}{$final}{$static}{$method->getName()}({$params}): {$returnType}";
+
+            $summary = minidocs_getDocSummary($method);
+            if ($summary) {
+                echo " // {$summary}";
+            }
+
+            // Show if inherited
+            $declaringClass = $method->getDeclaringClass();
+            if ($declaringClass->getName() !== $className) {
+                echo " [from {$declaringClass->getName()}]";
+            }
+            echo "\n";
+        }
+    }
+
+    // Show source location
+    if ($reflection->getFileName()) {
+        $file = relativePath($reflection->getFileName());
+        echo "\nsource: {$file}:{$reflection->getStartLine()}-{$reflection->getEndLine()}\n";
+    }
+}
+
+/**
+ * Show documentation for a function
+ */
+function showFunctionDocumentation(string $functionName): void {
+    $reflection = new ReflectionFunction($functionName);
+
+    $returnType = $reflection->getReturnType() ? formatType($reflection->getReturnType()) : 'mixed';
+    $params = formatParameters($reflection);
+
+    echo "function {$reflection->getName()}({$params}): {$returnType}\n";
+
+    // Show documentation
+    $docSummary = minidocs_getDocSummary($reflection);
+    if ($docSummary) {
+        echo "  {$docSummary}\n";
+    }
+    $docDescription = minidocs_getDocDescription($reflection);
+    if ($docDescription) {
+        echo "  {$docDescription}\n";
+    }
+
+    // Show parameters
+    $parameters = $reflection->getParameters();
+    if (!empty($parameters)) {
+        echo "\nparameters:\n";
+        foreach ($parameters as $param) {
+            $type = $param->getType() ? formatType($param->getType()) : 'mixed';
+            $name = '$' . $param->getName();
+            $default = '';
+            if ($param->isOptional() && $param->isDefaultValueAvailable()) {
+                $default = ' = ' . var_export($param->getDefaultValue(), true);
+            }
+            echo "  {$type} {$name}{$default}\n";
+        }
+    }
+
+    // Show source location
+    if ($reflection->getFileName()) {
+        $file = relativePath($reflection->getFileName());
+        echo "\nsource: {$file}:{$reflection->getStartLine()}-{$reflection->getEndLine()}\n";
+    }
+}
+
+/**
+ * Show documentation for a specific method
+ */
+function showMethodDocumentation(string $className, string $methodName): void {
+    $reflection = new ReflectionClass($className);
+
+    if (!$reflection->hasMethod($methodName)) {
+        fwrite(STDERR, "Error: Method '{$methodName}' not found in class '{$className}'\n");
+        exit(1);
+    }
+
+    $method = $reflection->getMethod($methodName);
+
+    // Show class context
+    $type = $reflection->isInterface() ? 'interface' : ($reflection->isTrait() ? 'trait' : 'class');
+    echo "{$type} {$className}\n\n";
+
+    // Show method signature
+    $vis = $method->isPublic() ? 'public' : ($method->isProtected() ? 'protected' : 'private');
+    $static = $method->isStatic() ? 'static ' : '';
+    $abstract = $method->isAbstract() ? 'abstract ' : '';
+    $final = $method->isFinal() ? 'final ' : '';
+    $returnType = $method->getReturnType() ? formatType($method->getReturnType()) : 'mixed';
+    $params = formatParameters($method);
+
+    echo "method {$vis} {$abstract}{$final}{$static}{$methodName}({$params}): {$returnType}\n";
+
+    // Show documentation
+    $docSummary = minidocs_getDocSummary($method);
+    if ($docSummary) {
+        echo "  {$docSummary}\n";
+    }
+    $docDescription = minidocs_getDocDescription($method);
+    if ($docDescription) {
+        echo "  {$docDescription}\n";
+    }
+
+    // Show if inherited
+    $declaringClass = $method->getDeclaringClass();
+    if ($declaringClass->getName() !== $className) {
+        echo "\ninherited from: {$declaringClass->getName()}\n";
+    }
+
+    // Show parameters
+    $parameters = $method->getParameters();
+    if (!empty($parameters)) {
+        echo "\nparameters:\n";
+        foreach ($parameters as $param) {
+            $type = $param->getType() ? formatType($param->getType()) : 'mixed';
+            $name = '$' . $param->getName();
+            $default = '';
+            if ($param->isOptional() && $param->isDefaultValueAvailable()) {
+                $default = ' = ' . var_export($param->getDefaultValue(), true);
+            }
+            echo "  {$type} {$name}{$default}\n";
+        }
+    }
+
+    // Show source location
+    if ($method->getFileName()) {
+        $file = relativePath($method->getFileName());
+        echo "\nsource: {$file}:{$method->getStartLine()}-{$method->getEndLine()}\n";
+    }
+}
+
+/**
+ * Get summary (first line) from docblock
+ */
+function minidocs_getDocSummary(ReflectionClass|ReflectionFunction|ReflectionMethod|ReflectionProperty|ReflectionClassConstant $reflection): string {
+    $docComment = $reflection->getDocComment();
+    if (!$docComment) {
+        return '';
+    }
+
+    $cleaned = minidocs_cleanDocblock($docComment);
+    $lines = explode("\n", $cleaned);
+
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line && !str_starts_with($line, '@')) {
+            return $line;
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Get full description from docblock (excluding summary and tags)
+ */
+function minidocs_getDocDescription(ReflectionClass|ReflectionFunction|ReflectionMethod|ReflectionProperty|ReflectionClassConstant $reflection): string {
+    $docComment = $reflection->getDocComment();
+    if (!$docComment) {
+        return '';
+    }
+
+    $cleaned = minidocs_cleanDocblock($docComment);
+    $lines = explode("\n", $cleaned);
+
+    $description = [];
+    $foundSummary = false;
+
+    foreach ($lines as $line) {
+        $line = trim($line);
+
+        // Skip tags
+        if (str_starts_with($line, '@')) {
+            break;
+        }
+
+        // First non-empty line is summary, skip it
+        if (!$foundSummary && $line) {
+            $foundSummary = true;
+            continue;
+        }
+
+        // After summary, collect description lines
+        if ($foundSummary) {
+            $description[] = $line;
+        }
+    }
+
+    return trim(implode("\n", $description));
+}
+
+/**
+ * Clean docblock formatting
+ */
+function minidocs_cleanDocblock(string $docComment): string {
+    if (empty($docComment)) {
+        return '';
+    }
+
+    $lines = explode("\n", $docComment);
+    $cleaned = [];
+
+    foreach ($lines as $i => $line) {
+        $trimmed = ltrim($line);
+
+        // First line: remove /**
+        if ($i === 0 && str_starts_with($trimmed, '/**')) {
+            $trimmed = substr($trimmed, 3);
+        }
+
+        // Last line: remove */
+        if ($i === count($lines) - 1 && str_ends_with($trimmed, '*/')) {
+            $trimmed = substr($trimmed, 0, -2);
+        }
+
+        // Remove leading * and space
+        if (str_starts_with($trimmed, '* ')) {
+            $trimmed = substr($trimmed, 2);
+        } elseif (str_starts_with($trimmed, '*')) {
+            $trimmed = substr($trimmed, 1);
+        }
+
+        $cleaned[] = $trimmed;
+    }
+
+    return trim(implode("\n", $cleaned));
+}
+
+/**
+ * Format a ReflectionType as a string
+ */
+function formatType(ReflectionType $type): string {
+    if ($type instanceof ReflectionNamedType) {
+        $name = $type->getName();
+        return $type->allowsNull() && $name !== 'null' && $name !== 'mixed' ? '?' . $name : $name;
+    } elseif ($type instanceof ReflectionUnionType) {
+        $types = array_map(fn($t) => formatType($t), $type->getTypes());
+        return implode('|', $types);
+    } elseif ($type instanceof ReflectionIntersectionType) {
+        $types = array_map(fn($t) => formatType($t), $type->getTypes());
+        return implode('&', $types);
+    }
+    return 'mixed';
+}
+
+/**
+ * Format function/method parameters
+ */
+function formatParameters(ReflectionFunction|ReflectionMethod $reflection): string {
+    $params = [];
+    foreach ($reflection->getParameters() as $param) {
+        $str = '';
+
+        // Type
+        if ($param->getType()) {
+            $str .= formatType($param->getType()) . ' ';
+        }
+
+        // Variadic
+        if ($param->isVariadic()) {
+            $str .= '...';
+        }
+
+        // By reference
+        if ($param->isPassedByReference()) {
+            $str .= '&';
+        }
+
+        // Name
+        $str .= '$' . $param->getName();
+
+        // Default value
+        if ($param->isOptional()) {
+            if ($param->isDefaultValueAvailable()) {
+                try {
+                    $str .= ' = ' . var_export($param->getDefaultValue(), true);
+                } catch (Throwable $e) {
+                    // Some default values reference constants that aren't available during reflection
+                    if ($param->isDefaultValueConstant()) {
+                        $str .= ' = ' . $param->getDefaultValueConstantName();
+                    } else {
+                        $str .= ' = ?';
+                    }
+                }
+            } else {
+                $str .= ' = ?';
+            }
+        }
+
+        $params[] = $str;
+    }
+
+    return implode(', ', $params);
+}
+
+/**
+ * Show documentation for a specific property
+ */
+function showPropertyDocumentation(string $className, string $propertyName): void {
+    $reflection = new ReflectionClass($className);
+
+    if (!$reflection->hasProperty($propertyName)) {
+        fwrite(STDERR, "Error: Property '{$propertyName}' not found in class '{$className}'\n");
+        exit(1);
+    }
+
+    $property = $reflection->getProperty($propertyName);
+
+    // Show class context
+    $type = $reflection->isInterface() ? 'interface' : ($reflection->isTrait() ? 'trait' : 'class');
+    echo "{$type} {$className}\n\n";
+
+    // Show property signature
+    $vis = $property->isPublic() ? 'public' : ($property->isProtected() ? 'protected' : 'private');
+    $static = $property->isStatic() ? 'static ' : '';
+    $readonly = $property->isReadOnly() ? 'readonly ' : '';
+    $propType = $property->getType() ? formatType($property->getType()) : 'mixed';
+
+    echo "property {$vis} {$static}{$readonly}{$propType} \${$propertyName}\n";
+
+    // Show documentation
+    $docSummary = minidocs_getDocSummary($property);
+    if ($docSummary) {
+        echo "  {$docSummary}\n";
+    }
+    $docDescription = minidocs_getDocDescription($property);
+    if ($docDescription) {
+        echo "  {$docDescription}\n";
+    }
+
+    // Show default value for static properties
+    if ($property->isStatic() && $property->isInitialized()) {
+        $defaultValue = $property->getValue();
+        echo "\ndefault value:\n";
+        echo "  " . var_export($defaultValue, true) . "\n";
+    }
+
+    // Show if inherited
+    $declaringClass = $property->getDeclaringClass();
+    if ($declaringClass->getName() !== $className) {
+        echo "\ninherited from: {$declaringClass->getName()}\n";
+    }
+
+    // Show source location
+    if ($declaringClass->getFileName()) {
+        $file = relativePath($declaringClass->getFileName());
+        echo "\nsource: {$file}\n";
+    }
+}
+
+/**
+ * Show documentation for a specific constant
+ */
+function showConstantDocumentation(string $className, string $constantName): void {
+    $reflection = new ReflectionClass($className);
+
+    if (!$reflection->hasConstant($constantName)) {
+        fwrite(STDERR, "Error: Constant '{$constantName}' not found in class '{$className}'\n");
+        exit(1);
+    }
+
+    // Show class context
+    $type = $reflection->isEnum() ? 'enum' : ($reflection->isInterface() ? 'interface' : ($reflection->isTrait() ? 'trait' : 'class'));
+    echo "{$type} {$className}\n\n";
+
+    $constantValue = $reflection->getConstant($constantName);
+
+    // For enums, show the case
+    if ($reflection->isEnum()) {
+        echo "case {$constantName}";
+        if (is_object($constantValue) && property_exists($constantValue, 'value')) {
+            echo " = " . var_export($constantValue->value, true);
+        }
+        echo "\n";
+    } else {
+        echo "constant {$constantName} = " . var_export($constantValue, true) . "\n";
+    }
+
+    // Try to get documentation from ReflectionClassConstant
+    try {
+        $constantReflection = new ReflectionClassConstant($className, $constantName);
+        $docSummary = minidocs_getDocSummary($constantReflection);
+        if ($docSummary) {
+            echo "  {$docSummary}\n";
+        }
+        $docDescription = minidocs_getDocDescription($constantReflection);
+        if ($docDescription) {
+            echo "  {$docDescription}\n";
+        }
+    } catch (ReflectionException $e) {
+        // Constant might not have reflection available
+    }
+
+    // Show source location
+    if ($reflection->getFileName()) {
+        $file = relativePath($reflection->getFileName());
+        echo "\nsource: {$file}\n";
+    }
+}
