@@ -1,16 +1,859 @@
-#!/usr/bin/env bash
+#!/usr/bin/env php
+<?php
 
-# Fubber - Multi-language codebase inspection tool
-#
-# This dispatcher currently delegates all commands to fubber-php.
-# In the future, it will detect the project language and delegate to:
-#   - fubber-php for PHP projects
-#   - fubber-python for Python projects
-#   - fubber-js for JavaScript/TypeScript projects
-#   - etc.
+/**
+ * Fubber - Multi-language Codebase Inspection Tool
+ *
+ * Main command for language-agnostic operations:
+ *   - index: Index codebase into FTS5 database
+ *   - find: Full-text search across indexed code
+ *   - projects: List indexed projects
+ *
+ * Language-specific sub-commands:
+ *   - php <target>: PHP reflection (delegates to fubber-php)
+ *   - js <target>: JavaScript inspection (future)
+ *   - py <target>: Python inspection (future)
+ */
 
-# Find the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+// Load Fubber's own dependencies
+$autoloadPath = __DIR__ . '/../vendor/autoload.php';
+if (!file_exists($autoloadPath)) {
+    // Can't use Output class yet - autoload not available
+    fwrite(STDERR, "Error: Could not find fubbertool dependencies\n");
+    fwrite(STDERR, "Run 'composer install' in " . dirname(__DIR__) . "\n");
+    exit(1);
+}
 
-# For now, just delegate to fubber-php
-exec "${SCRIPT_DIR}/fubber-php" "$@"
+require_once $autoloadPath;
+
+// Increase PCRE limits to handle large files with complex patterns
+// Defaults are too small for large source files with nested structures
+ini_set('pcre.jit', '1');  // Enable JIT by default for performance (with fallback on errors)
+ini_set('pcre.backtrack_limit', '10000000'); // 10M (default: 1M)
+ini_set('pcre.recursion_limit', '500000');   // 500K (default: 100K)
+
+// Parse global verbosity flags from anywhere in argv
+$verbosity = 0;
+foreach ($argv as $arg) {
+    if ($arg === '-v') {
+        $verbosity = 1;
+    } elseif ($arg === '-vv') {
+        $verbosity = 2;
+    } elseif ($arg === '-vvv') {
+        $verbosity = 3;
+    } elseif ($arg === '--verbose') {
+        $verbosity = max($verbosity, 1);
+    }
+}
+
+// Create global singleton Output instance
+// This is the ONLY Output instance that should be used throughout the application
+$GLOBALS['fubber_output'] = new \FubberTool\Output(STDOUT, $verbosity, STDERR);
+
+/**
+ * Get the global Output singleton
+ */
+function output(): \FubberTool\Output
+{
+    return $GLOBALS['fubber_output'];
+}
+
+// Parse command
+$command = $argv[1] ?? '';
+
+if (empty($command) || $command === '--help' || $command === '-h') {
+    // Simplified bootstrap: check if we're in a registered project
+    $projectRoot = null;
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $projectRoot = \FubberTool\Index\ProjectDetector::detectRegistered($db, getcwd());
+        output()->writeln("Current project root: $projectRoot");
+        output()->writeln();
+    } catch (\Exception $e) {
+        // No project root found - will show suggestions below
+    }
+
+    showHelp();
+
+    // Show project root suggestions if no project root was detected
+    if ($projectRoot === null) {
+        $suggestions = \FubberTool\Index\ProjectDetector::findProjectRootSuggestions(getcwd());
+
+        output()->writeln();
+        output()->warn("No project root detected. To create a project root:");
+        output()->writeln();
+        foreach ($suggestions as $suggestion) {
+            output()->writeln("  fubber init {$suggestion['path']}    # {$suggestion['reason']}");
+        }
+        output()->writeln("  fubber init .    # Create project root in current directory");
+    }
+
+    exit(0);
+}
+
+// Handle sub-command help delegation
+if ($command === 'php' && (in_array('--help', $argv) || in_array('-h', $argv) || count($argv) === 2)) {
+    // Delegate to fubber-php for help
+    $fubberPhpPath = __DIR__ . '/fubber-php';
+    if (file_exists($fubberPhpPath)) {
+        passthru(escapeshellcmd($fubberPhpPath) . ' --help');
+        exit(0);
+    } else {
+        output()->error("Error: fubber-php not found");
+        exit(1);
+    }
+}
+
+// Handle language-agnostic operations
+if ($command === 'init') {
+    handleInitCommand($argv, $verbosity);
+    exit(0);
+}
+
+if ($command === 'index') {
+    $subcommand = $argv[2] ?? null;
+
+    if ($subcommand === null || $subcommand === '--help' || $subcommand === '-h') {
+        showIndexHelp();
+        exit(0);
+    }
+
+    if ($subcommand === 'status') {
+        handleIndexStatusCommand($argv);
+    } elseif ($subcommand === 'rebuild') {
+        handleIndexRebuildCommand($argv);
+    } elseif ($subcommand === 'update') {
+        handleIndexUpdateCommand($argv);
+    } else {
+        output()->error("Unknown index subcommand: $subcommand");
+        output()->writeln();
+        showIndexHelp();
+        exit(1);
+    }
+    exit(0);
+}
+
+if ($command === 'list') {
+    handleListCommand($argv);
+    exit(0);
+}
+
+if ($command === 'delete') {
+    handleDeleteCommand($argv);
+    exit(0);
+}
+
+if ($command === 'find') {
+    handleFindCommand($argv);
+    exit(0);
+}
+
+// Handle language-specific sub-commands
+if ($command === 'php') {
+    // Delegate to fubber-php with remaining arguments
+    $fubberPhpPath = __DIR__ . '/fubber-php';
+    if (!file_exists($fubberPhpPath)) {
+        output()->error("Error: fubber-php not found");
+        exit(1);
+    }
+
+    // Remove 'php' from argv and pass rest to fubber-php
+    array_splice($argv, 1, 1);
+    $args = array_slice($argv, 1);
+
+    pcntl_exec($fubberPhpPath, $args) or passthru(escapeshellcmd($fubberPhpPath) . ' ' . implode(' ', array_map('escapeshellarg', $args)));
+    exit(0);
+}
+
+// Unknown command
+output()->error("Error: Unknown command '$command'");
+output()->error("Run 'fubber --help' for usage");
+exit(1);
+
+/**
+ * Show help message
+ */
+function showHelp(): void
+{
+    // Check if PHP reflection is available (vendor/autoload.php exists)
+    $phpAvailable = hasPhpReflection();
+
+    output()->title("Fubber - Multi-language Codebase Inspection Tool");
+    output()->writeln();
+
+    output()->writeln("USAGE:");
+    output()->writeln("  fubber <command> [options]");
+    output()->writeln();
+
+    output()->usageList('COMMANDS:', [
+        ['fubber init <path> [-y]', 'Create and index a project root'],
+        ['fubber index <command>', 'Manage fulltext search index'],
+        ['fubber list', 'List all registered project roots'],
+        ['fubber delete [path] [-y]', 'Delete a project root and its indexed files'],
+        ['fubber find <query>', 'Full-text search across indexed code (run with no query for help)'],
+    ]);
+    output()->writeln();
+
+    if ($phpAvailable) {
+        output()->writeln("LANGUAGE-SPECIFIC INSPECTION:");
+        output()->writeln("  fubber php [options]           PHP reflection-based code inspection");
+        output()->writeln();
+        output()->writeln("                                 Uses composer autoloader to resolve symbols,");
+        output()->writeln("                                 analyze type hierarchies, find implementations,");
+        output()->writeln("                                 and provide detailed documentation via reflection.");
+        output()->writeln("                                 Supplements FTS5 search with type-aware queries.");
+        output()->writeln();
+        output()->writeln("                                 Run 'fubber php --help' for detailed options.");
+        output()->writeln();
+        output()->writeln();
+    }
+
+    output()->usageList('GLOBAL OPTIONS:', [
+        ['-h, --help', 'Show this help message'],
+        ['-v', 'Verbose output (level 1)'],
+        ['-vv', 'Very verbose output (level 2)'],
+        ['-vvv', 'Debug output - maximum verbosity (level 3)'],
+    ]);
+
+    output()->writeln();
+    output()->writeln("ENVIRONMENT VARIABLES:");
+    output()->writeln("  FUBBER_DEV=1    Enable development mode (fail fast on errors instead of skipping)");
+}
+
+/**
+ * Show index command help
+ */
+function showIndexHelp(): void
+{
+    output()->title("Manage fulltext search index");
+    output()->writeln();
+
+    output()->writeln("USAGE:");
+    output()->writeln("  fubber index <command> [options]");
+    output()->writeln();
+
+    output()->usageList('COMMANDS:', [
+        ['fubber index status', 'Show indexing status for current project'],
+        ['fubber index rebuild [-v]', 'Rebuild index for current project'],
+        ['fubber index update [-v]', 'Incrementally update index (scan for changes)'],
+    ]);
+    output()->writeln();
+
+    output()->usageList('OPTIONS:', [
+        ['-h, --help', 'Show this help message'],
+        ['-v, --verbose', 'Verbose output'],
+    ]);
+}
+
+/**
+ * Check if PHP reflection is available
+ */
+function hasPhpReflection(): bool
+{
+    try {
+        // First detect the current project root (non-interactive)
+        $db = \FubberTool\Index\Schema::connect();
+        $projectRoot = \FubberTool\Index\ProjectDetector::detectRegistered($db, getcwd());
+
+        // Check if vendor/autoload.php exists within the project root
+        // Search from current dir up to (and including) project root
+        $dir = getcwd();
+        while ($dir !== dirname($projectRoot)) {
+            if (file_exists($dir . '/vendor/autoload.php')) {
+                return true;
+            }
+            if ($dir === $projectRoot) {
+                break;
+            }
+            $dir = dirname($dir);
+        }
+
+        return false;
+    } catch (\Exception $e) {
+        // No project detected or other error - PHP reflection not available
+        return false;
+    }
+}
+
+/**
+ * Handle index status command
+ */
+function handleIndexStatusCommand(array $argv): void
+{
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd(), false);
+
+        // Get project info
+        $projects = \FubberTool\Index\Schema::getProjectRoots($db);
+        $projectInfo = null;
+        foreach ($projects as $project) {
+            if ($project['project_root'] === $projectRoot) {
+                $projectInfo = $project;
+                break;
+            }
+        }
+
+        echo "Project root: $projectRoot\n";
+
+        if ($projectInfo && $projectInfo['last_indexed']) {
+            $lastIndexed = date('Y-m-d H:i:s', $projectInfo['last_indexed']);
+            echo "Last indexed: $lastIndexed\n";
+        } else {
+            echo "Last indexed: Never\n";
+        }
+
+        // Count indexed files from file_metadata (fast - has index on project_root)
+        $result = $db->queryRow("SELECT COUNT(*) as file_count, SUM(entry_count) as entity_count FROM file_metadata WHERE project_root = ?", [$projectRoot]);
+        $fileCount = $result['file_count'] ?? 0;
+        $entityCount = $result['entity_count'] ?? 0;
+
+        echo "Indexed entities: $entityCount\n";
+        echo "Indexed files: $fileCount\n";
+
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle index rebuild command
+ */
+function handleIndexRebuildCommand(array $argv): void
+{
+    $verbose = in_array('-v', $argv) || in_array('--verbose', $argv);
+
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd(), false);
+
+        if ($verbose) {
+            echo "Project root: $projectRoot\n\n";
+        }
+
+        $indexer = new \FubberTool\Index\Indexer($db, $projectRoot);
+        $indexer->indexProject($verbose);
+
+        if (!$verbose) {
+            echo "Indexing complete.\n";
+        }
+
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle index update command (incremental)
+ */
+function handleIndexUpdateCommand(array $argv): void
+{
+    $verbose = in_array('-v', $argv) || in_array('--verbose', $argv);
+
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd(), false);
+
+        $indexer = new \FubberTool\Index\Indexer($db, $projectRoot);
+        $indexer->updateProject($verbose);
+
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle init command
+ */
+function handleInitCommand(array $argv, int $verbosity): void
+{
+    $projectPath = $argv[2] ?? null;
+    $forceYes = in_array('-y', $argv) || in_array('--yes', $argv);
+
+    if ($projectPath === null) {
+        output()->error("Error: Path argument required");
+        output()->writeln("Usage: fubber [-vvv] init <path> [-y]");
+        output()->writeln();
+        output()->writeln("Examples:");
+        output()->writeln("  fubber init .                    # Initialize current directory");
+        output()->writeln("  fubber init /path/to/project     # Initialize specific directory");
+        output()->writeln("  fubber init . -y                 # Force init even inside existing project");
+        output()->writeln("  fubber -vvv init .               # Maximum verbosity (debug output)");
+        exit(1);
+    }
+
+    // Resolve to absolute path
+    $absolutePath = realpath($projectPath);
+    if (!$absolutePath) {
+        output()->error("Error: Invalid path '$projectPath'");
+        exit(1);
+    }
+
+    if (!is_dir($absolutePath)) {
+        output()->error("Error: '$projectPath' is not a directory");
+        exit(1);
+    }
+
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+
+        // Check if this exact path is already registered, or if we're inside an existing project
+        $projects = \FubberTool\Index\Schema::getProjectRoots($db);
+        $insideExistingProject = false;
+        $existingRoot = null;
+        $alreadyRegistered = false;
+
+        foreach ($projects as $project) {
+            $existingProjectRoot = $project['project_root'];
+
+            // Check if this exact path is already registered
+            if ($existingProjectRoot === $absolutePath) {
+                $alreadyRegistered = true;
+                break;
+            }
+
+            // Check if the new project is inside an existing project root
+            if (str_starts_with($absolutePath . '/', $existingProjectRoot . '/')) {
+                $insideExistingProject = true;
+                $existingRoot = $existingProjectRoot;
+                break;
+            }
+        }
+
+        if ($alreadyRegistered && !$forceYes) {
+            output()->error("Error: A project already exists at this location: $absolutePath");
+            output()->writeln("Use 'fubber index rebuild' to re-index, or -y flag to force re-initialization.");
+            exit(1);
+        }
+
+        if ($insideExistingProject && !$forceYes) {
+            output()->error("Error: This directory is already indexed via a project at path $existingRoot");
+            output()->writeln("Use -y flag to create a sub-project root anyway.");
+            exit(1);
+        }
+
+        // Register in database (no marker file needed - database is the source of truth)
+        \FubberTool\Index\Schema::registerProjectRoot($db, $absolutePath);
+        output()->writeln("Registered project root: $absolutePath");
+
+        if ($insideExistingProject) {
+            output()->writeln("Note: This is a sub-project inside $existingRoot");
+            output()->writeln("Files are already indexed. Run 'fubber index rebuild' to re-index.");
+        } else {
+            // Automatically index the new project
+            output()->writeln("Indexing project...");
+            $indexer = new \FubberTool\Index\Indexer($db, $absolutePath);
+            $indexer->indexProject($verbosity > 0);
+            output()->writeln("Indexing complete.");
+        }
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle list command
+ */
+function handleListCommand(array $argv): void
+{
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $projects = \FubberTool\Index\Schema::getProjectRoots($db);
+
+        if (empty($projects)) {
+            output()->writeln("No project roots registered.");
+            return;
+        }
+
+        // Prepare table data
+        $headings = ['Project root', 'Last accessed', 'Last indexed'];
+        $rows = [];
+
+        foreach ($projects as $project) {
+            $lastAccessed = $project['last_accessed']
+                ? date('Y-m-d H:i:s', $project['last_accessed'])
+                : 'Never';
+
+            $lastIndexed = $project['last_indexed']
+                ? date('Y-m-d H:i:s', $project['last_indexed'])
+                : 'Never';
+
+            $rows[] = [
+                $project['project_root'],
+                $lastAccessed,
+                $lastIndexed,
+            ];
+        }
+
+        output()->table($headings, $rows);
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle delete command
+ */
+function handleDeleteCommand(array $argv): void
+{
+    $path = null;
+    $forceYes = false;
+
+    // Parse arguments
+    for ($i = 2; $i < count($argv); $i++) {
+        if ($argv[$i] === '-y' || $argv[$i] === '--yes') {
+            $forceYes = true;
+        } elseif ($path === null && !str_starts_with($argv[$i], '-')) {
+            $path = $argv[$i];
+        }
+    }
+
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+
+        // If no path given, detect current project root
+        if ($path === null) {
+            $path = \FubberTool\Index\ProjectDetector::detect($db, getcwd(), false);
+            echo "Deleting current project root: $path\n";
+        } else {
+            // Convert to absolute path if relative
+            if (!str_starts_with($path, '/')) {
+                $originalPath = $path;
+                $path = realpath($path) ?: getcwd() . '/' . $path;
+
+                // Ask for confirmation for relative paths
+                if (!$forceYes) {
+                    echo "Delete project root: $path\n";
+                    echo "(resolved from relative path: $originalPath)\n";
+                    echo "Continue? [y/N]: ";
+                    $response = trim(fgets(STDIN));
+                    if (strtolower($response) !== 'y') {
+                        echo "Cancelled.\n";
+                        exit(0);
+                    }
+                }
+            }
+        }
+
+        // Ensure path is absolute
+        $path = realpath($path) ?: $path;
+
+        // Check if this project root exists
+        $projects = \FubberTool\Index\Schema::getProjectRoots($db);
+        $found = false;
+        foreach ($projects as $project) {
+            if ($project['project_root'] === $path) {
+                $found = true;
+                break;
+            }
+        }
+
+        if (!$found) {
+            output()->error("Error: $path is not a registered project root");
+            output()->error("Run 'fubber list' to see registered roots");
+            exit(1);
+        }
+
+        // Get count before deleting for reporting
+        $stmt = $db->prepare("SELECT SUM(entry_count) FROM file_metadata WHERE project_root = ?");
+        $stmt->execute([$path]);
+        $deletedCount = $stmt->fetchColumn() ?? 0;
+
+        // Delete from project_roots table
+        $stmt = $db->prepare("DELETE FROM project_roots WHERE project_root = ?");
+        $stmt->execute([$path]);
+
+        // Delete all indexed files for this project (handles overlapping roots)
+        \FubberTool\Index\Schema::deleteProject($db, $path);
+
+        echo "Deleted project root: $path\n";
+        if ($deletedCount > 0) {
+            echo "Removed $deletedCount indexed entities\n";
+        }
+
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle find command
+ */
+function handleFindCommand(array $argv): void
+{
+    $query = null;
+    $projectPath = null;
+    $limit = 20;
+
+    for ($i = 2; $i < count($argv); $i++) {
+        if ($argv[$i] === '--limit' && isset($argv[$i + 1])) {
+            $limit = (int)$argv[$i + 1];
+            $i++;
+        } elseif ($argv[$i] === '--project' && isset($argv[$i + 1])) {
+            $projectPath = $argv[$i + 1];
+            $i++;
+        } elseif ($query === null) {
+            $query = $argv[$i];
+        }
+    }
+
+    if ($query === null) {
+        output()->title("Fubber Find - Language-agnostic FTS5 Full-text Search");
+        output()->writeln();
+
+        output()->writeln("USAGE:");
+        output()->writeln("  fubber find <query> [--project <path>] [--limit <n>]");
+        output()->writeln();
+
+        output()->writeln("QUERY SYNTAX:");
+        output()->writeln("  Standard FTS5 syntax: AND, OR, NOT, parentheses for grouping, quotes for phrases");
+        output()->writeln("  Field filters: field:term restricts search to specific field");
+        output()->writeln();
+
+        output()->usageList('SEARCHABLE FIELDS:', [
+            ['preamble', 'Comments, docblocks, decorators, attributes preceding code'],
+            ['signature', 'Function/class/method declarations (name and parameters)'],
+            ['body', 'Implementation code (function/method bodies)'],
+            ['namespace', 'Namespace/package/module path (e.g., App\\Models)'],
+            ['ext', 'File extension (php, js, py, css, md, etc.)'],
+            ['path', 'Relative file path within project'],
+        ]);
+        output()->writeln();
+
+        output()->writeln("TOKENIZATION:");
+        output()->writeln("  Custom tokenizer splits on whitespace, camelCase, and underscores:");
+        output()->writeln("  - \"getUserById\" → [get, User, By, Id]");
+        output()->writeln("  - \"user_name\" → [user, name]");
+        output()->writeln("  - All non-whitespace sequences indexed as tokens");
+        output()->writeln("  - Case-insensitive: \"getUser\", \"GetUser\", \"GETUSER\" all match");
+        output()->writeln();
+
+        output()->writeln("EXAMPLES:");
+        output()->writeln("  fubber find getUserById                     # Find functions/methods with camelCase components");
+        output()->writeln("  fubber find \"User AND save\"                 # Boolean operators");
+        output()->writeln("  fubber find \"signature:async\"               # Search only function signatures");
+        output()->writeln("  fubber find \"ext:py preamble:TODO\"          # Python files with TODO comments");
+        output()->writeln("  fubber find \"namespace:Models body:query\"   # Query usage in Models namespace");
+        output()->writeln("  fubber find 'path:src/Controllers'          # Search specific directory");
+        output()->writeln();
+
+        output()->usageList('OPTIONS:', [
+            ['--project <path>', 'Search specific project root instead of current'],
+            ['--limit <n>', 'Limit results (default: 20)'],
+        ]);
+
+        exit(0);
+    }
+
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $tokenizedQuery = \FubberTool\Index\Tokenizer::prepareQuery($query);
+
+        // Join FTS5 search with real table to get metadata
+        // Use bm25() for ranking - lower is better (negative values)
+        // Use snippet() to show match context (will need detokenizing)
+        // Use random markers that won't appear in code
+        $delim = bin2hex(random_bytes(4));
+        $markerStart = 'BeF' . $delim;
+        $markerEnd = 'AfT' . $delim;
+        $sql = "
+            SELECT
+                e.preamble_raw,
+                e.signature_raw,
+                e.namespace,
+                e.type,
+                e.filename,
+                e.line_start,
+                e.line_end,
+                bm25(code_index) as rank,
+                snippet(code_index, 2, '$markerStart', '$markerEnd', '...', 15) as body_snippet,
+                f.filetime
+            FROM code_index
+            JOIN code_entities e ON code_index.rowid = e.id
+            JOIN file_metadata f ON e.filename = f.filename
+            WHERE code_index MATCH ?
+        ";
+
+        $params = [$tokenizedQuery];
+
+        // Filter by project if specified
+        if ($projectPath !== null) {
+            $projectRoot = realpath($projectPath) ?: $projectPath;
+            $sql .= " AND e.filename LIKE ?";
+            $params[] = $projectRoot . '/%';
+        } else {
+            // Auto-detect current project
+            $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd());
+            $sql .= " AND e.filename LIKE ?";
+            $params[] = $projectRoot . '/%';
+        }
+
+        // Get total count first
+        $countSql = str_replace(
+            "SELECT
+                e.preamble_raw,
+                e.signature_raw,
+                e.namespace,
+                e.type,
+                e.filename,
+                e.line_start,
+                e.line_end,
+                bm25(code_index) as rank,
+                snippet(code_index, 2, '$markerStart', '$markerEnd', '...', 15) as body_snippet,
+                f.filetime",
+            "SELECT COUNT(*) as total",
+            $sql
+        );
+        $countStmt = $db->prepare($countSql);
+        $countStmt->execute($params);
+        $totalMatches = $countStmt->fetchColumn();
+        output()->debug(2, "Total matches: {count}", ['count' => $totalMatches]);
+
+        // Order by rank (best matches first), with recency boost
+        // BM25 returns negative scores (closer to 0 = better match)
+        // Add age penalty to make older files MORE negative (worse)
+        // Use S-curve penalty: recent files ~0, 1-year files ~2, older files asymptote to ~4
+        $oneYear = 365 * 24 * 60 * 60;
+        $now = time();
+
+        // Add computed adjusted_rank to SELECT for verification
+        // Note: Can't use 'rank' alias in same SELECT, must use bm25(code_index) directly
+        // Use .0 suffix to force floating-point division in SQLite
+        // Formula: 4 * (age_years^1.5) / (1 + age_years^1.5)
+        // This creates an S-curve: 7d≈0.01, 90d≈0.4, 1y≈2.0, 2y≈3.0, 5y≈3.7
+        $sql = str_replace(
+            "f.filetime",
+            "f.filetime, (bm25(code_index) + (4.0 * POWER((($now - f.filetime) / $oneYear.0), 1.5) / (1.0 + POWER((($now - f.filetime) / $oneYear.0), 1.5)))) as adjusted_rank",
+            $sql
+        );
+
+        $sql .= " ORDER BY adjusted_rank ASC";
+        // Fetch 3x the limit to account for filtering via canVisit()
+        $fetchLimit = $limit * 3;
+        $sql .= " LIMIT " . $fetchLimit;
+
+        $allResults = $db->query($sql, $params);
+        output()->debug(2, "Retrieved {count} results (before canVisit filter)", ['count' => count($allResults)]);
+
+        // Initialize FileDiscovery for filtering (sets up static properties)
+        $reflection = new ReflectionClass(\FubberTool\Index\FileDiscovery::class);
+        $projectRootProperty = $reflection->getProperty('projectRoot');
+        $projectRootProperty->setAccessible(true);
+        $projectRootProperty->setValue(null, $projectRoot);
+
+        $patternCacheProperty = $reflection->getProperty('patternCache');
+        $patternCacheProperty->setAccessible(true);
+        $patternCacheProperty->setValue(null, []);
+
+        // Filter results using FileDiscovery::canVisit()
+        $results = [];
+        foreach ($allResults as $result) {
+            // Stop once we have enough results
+            if (count($results) >= $limit) {
+                break;
+            }
+
+            $fileInfo = new SplFileInfo($result['filename']);
+            if (\FubberTool\Index\FileDiscovery::canVisit($fileInfo, $projectRoot)) {
+                $results[] = $result;
+            } else {
+                output()->debug(2, "Filtered out: {file}", ['file' => $result['filename']]);
+            }
+        }
+
+        output()->debug(2, "After canVisit filter: {count} results", ['count' => count($results)]);
+
+        // Display results
+        if (empty($results)) {
+            echo "No results found for: $query\n";
+            echo "Tokenized query: $tokenizedQuery\n";
+            exit(0);
+        }
+
+        if ($totalMatches > $limit) {
+            echo "Found $totalMatches matches (showing first $limit)\n\n";
+        } else {
+            echo "Found $totalMatches matches\n\n";
+        }
+
+        // Check if we're in a TTY for colored output
+        $isTty = posix_isatty(STDOUT);
+        $tealColor = "\033[96m";  // Bright cyan/teal
+        $resetColor = "\033[0m";
+
+        // Display results in rank order (no grouping)
+        foreach ($results as $result) {
+            $signature = trim($result['signature_raw']);
+            $preamble = trim($result['preamble_raw']);
+            $filename = $result['filename'];
+            $lineStart = $result['line_start'];
+            $lineEnd = $result['line_end'];
+            $bodySnippet = $result['body_snippet'] ?? '';
+            $rank = $result['rank'];
+            $filetime = $result['filetime'];
+
+            // Debug: show BM25 rank and file age
+            $fileAge = time() - $filetime;
+            $ageDays = round($fileAge / 86400);
+            $adjustedRank = $result['adjusted_rank'];
+            output()->debug(3, "BM25: {rank} | Age: {days}d | Adjusted: {adjusted}", [
+                'rank' => round($rank, 4),
+                'days' => $ageDays,
+                'adjusted' => round($adjustedRank, 4)
+            ]);
+
+            // Make filename relative to cwd (shorter paths for LLMs)
+            $cwd = getcwd();
+            if (strpos($filename, $cwd) === 0) {
+                $relativeFilename = substr($filename, strlen($cwd) + 1);
+            } else {
+                $relativeFilename = $filename;
+            }
+
+            // Output: filename:startLine-endLine:
+            echo "$relativeFilename:$lineStart-$lineEnd:\n";
+
+            // Show snippet if available
+            if (!empty($bodySnippet)) {
+                $readableSnippet = \FubberTool\Index\Tokenizer::detokenize($bodySnippet);
+
+                // Handle markers: colorize for TTY, strip for non-TTY
+                if ($isTty) {
+                    $readableSnippet = str_replace($markerStart, $tealColor, $readableSnippet);
+                    $readableSnippet = str_replace($markerEnd, $resetColor, $readableSnippet);
+                } else {
+                    $readableSnippet = str_replace([$markerStart, $markerEnd], '', $readableSnippet);
+                }
+
+                // Format with signature if present
+                if (!empty($signature)) {
+                    // 2 space indent for signature with trailing colon
+                    echo "  $signature:\n";
+                    // 4 space indent for snippet (part of signature)
+                    echo "    " . trim($readableSnippet) . "\n";
+                } else {
+                    // 2 space indent for snippet (no signature)
+                    echo "  " . trim($readableSnippet) . "\n";
+                }
+            } elseif (!empty($preamble)) {
+                // Fallback: show first line of preamble if no snippet
+                $firstLine = strtok($preamble, "\n");
+                if (!empty($firstLine)) {
+                    echo "  " . trim($firstLine) . "\n";
+                }
+            }
+
+            echo "\n";
+        }
+
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
