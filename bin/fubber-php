@@ -117,8 +117,8 @@ if (in_array($command, $relationshipCommands, true)) {
     exit(0);
 }
 
-// Check if this is a search command
-if ($command === 'search') {
+// Check if this is a find command
+if ($command === 'find') {
     // Check for flags
     $caseInsensitive = false;
     $pattern = '';
@@ -133,13 +133,13 @@ if ($command === 'search') {
 
     if (empty($pattern)) {
         fwrite(STDERR, "Error: Search pattern required\n");
-        fwrite(STDERR, "Usage: fubber search [-i] <pattern>\n");
+        fwrite(STDERR, "Usage: fubber php find [-i] <pattern>\n");
         fwrite(STDERR, "Options:\n");
         fwrite(STDERR, "  -i, --ignore-case    Case-insensitive search\n");
         fwrite(STDERR, "Examples:\n");
-        fwrite(STDERR, "  fubber search Router         # Case-sensitive substring search\n");
-        fwrite(STDERR, "  fubber search -i router      # Case-insensitive search\n");
-        fwrite(STDERR, "  fubber search '/.*Router$/'  # Regex search (use / delimiters)\n");
+        fwrite(STDERR, "  fubber php find Router         # Case-sensitive substring search\n");
+        fwrite(STDERR, "  fubber php find -i router      # Case-insensitive search\n");
+        fwrite(STDERR, "  fubber php find '/.*Router$/'  # Regex search (use / delimiters)\n");
         exit(1);
     }
 
@@ -809,15 +809,15 @@ function typeMatches(ReflectionType $reflectionType, string $targetType): bool {
 }
 
 /**
- * Search for entities matching a pattern
+ * Find entities matching a pattern (via: fubber php find)
  *
- * Searches:
+ * Uses PHP reflection to search:
  *   - Entity names (classes, interfaces, traits, enums, functions)
  *   - Method names and signatures (parameters, return types)
  *   - Property names and types
  *   - Constant names
  *
- * Future enhancement: FTS5-based full-text search through documentation content
+ * Note: For full-text search through code content, use: fubber find
  */
 function searchEntities(string $pattern, bool $caseInsensitive = false): void {
     // Load all classes first
@@ -1110,41 +1110,47 @@ function searchEntities(string $pattern, bool $caseInsensitive = false): void {
  */
 function showHelp(): void {
     echo <<<HELP
-Fubber - PHP Codebase Inspection Tool
+Fubber PHP - PHP Reflection-based Code Inspection
 
-Usage:
-  fubber <target>                       # Show documentation for specific entity
-  fubber search [-i] <pattern>          # Search names and signatures
-  fubber implements <interface>         # Find all implementations
-  fubber extends <class>                # Find all subclasses
-  fubber uses <trait>                   # Find all trait users
-  fubber accepts <type>                 # Find methods accepting a type
-  fubber returns <type>                 # Find methods returning a type
-  fubber compatible <interface>         # Check interface compatibility
-  fubber attributes <attribute>         # Find attribute usage
+USAGE:
+  fubber php <target>                   # Show documentation for entity (class, function, namespace)
+  fubber php find [-i] <pattern>        # Find by name/signature (reflection-based)
+  fubber php implements <interface>     # Find all implementations
+  fubber php extends <class>            # Find all subclasses
+  fubber php uses <trait>               # Find all trait users
+  fubber php accepts <type>             # Find methods accepting a type
+  fubber php returns <type>             # Find methods returning a type
+  fubber php compatible <interface>     # Check interface compatibility
+  fubber php attributes <attribute>     # Find attribute usage
 
-Lookup Examples:
-  fubber App\\Models                                    # Show namespace overview
-  fubber "App\\Models\\User"                            # Show class documentation
-  fubber "App\\Models\\User::save"                      # Show method documentation
-  fubber "App\\Helpers\\formatDate"                     # Show function documentation
+ENTITY LOOKUP:
+  fubber php App\\Models                                    # Show namespace overview
+  fubber php "App\\Models\\User"                            # Show class documentation
+  fubber php "App\\Models\\User::save"                      # Show method documentation
+  fubber php "App\\Helpers\\formatDate"                     # Show function documentation
 
-Search Examples (case-sensitive by default):
-  fubber search Router                                  # Find "Router" in names/signatures
-  fubber search -i router                               # Case-insensitive search
-  fubber search '\$request'                             # Find methods with \$request parameter
-  fubber search '/^interface.*able$/'                   # Regex: interfaces ending with "able"
+REFLECTION FIND (case-sensitive by default):
+  fubber php find Router                                    # Find "Router" in names/signatures
+  fubber php find -i router                                 # Case-insensitive search
+  fubber php find '\$request'                               # Find methods with \$request parameter
+  fubber php find '/^interface.*able$/'                     # Regex: interfaces ending with "able"
 
-Relationship Queries:
-  fubber implements CacheInterface                      # All classes implementing interface
-  fubber extends Repository                             # All subclasses of Repository
-  fubber accepts Request                                # Methods accepting Request type
-  fubber returns Response                               # Methods returning Response type
-  fubber compatible Psr\\Log\\LoggerInterface           # Show required methods + implementations
-  fubber attributes Route                               # Find all #[Route] attribute uses
+RELATIONSHIP QUERIES:
+  fubber php implements CacheInterface                      # All classes implementing interface
+  fubber php extends Repository                             # All subclasses of Repository
+  fubber php accepts Request                                # Methods accepting Request type
+  fubber php returns Response                               # Methods returning Response type
+  fubber php compatible Psr\\Log\\LoggerInterface           # Show required methods + implementations
+  fubber php attributes Route                               # Find all #[Route] attribute uses
 
-Note: Use quotes or double backslashes to escape namespace separators:
-  fubber "App\\SomeClass"  or  fubber App\\\\SomeClass
+NOTES:
+  - Requires composer autoloader (vendor/autoload.php)
+  - Uses PHP reflection to analyze loaded classes
+  - Complements 'fubber find' (FTS5 search) with type-aware queries
+  - Use quotes or double backslashes to escape namespace separators:
+    fubber php "App\\SomeClass"  or  fubber php App\\\\SomeClass
+
+For language-agnostic full-text search, use: fubber find <query>
 
 HELP;
 }
@@ -1931,3 +1937,7 @@ function showConstantDocumentation(string $className, string $constantName): voi
         echo "\nsource: {$file}\n";
     }
 }
+
+/**
+ * Handle the index command
+ */

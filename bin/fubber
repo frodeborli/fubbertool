@@ -583,6 +583,32 @@ function handleDeleteCommand(array $argv): void
 }
 
 /**
+ * Check if content is binary
+ *
+ * @param string $content File content to check
+ * @return bool True if content appears to be binary
+ */
+function isBinary(string $content): bool
+{
+    // Check first 8KB for null bytes (common binary indicator)
+    $sample = substr($content, 0, 8192);
+    return strpos($sample, "\0") !== false;
+}
+
+/**
+ * Add indentation to all lines in a string
+ *
+ * @param string $text Text to indent
+ * @param int $spaces Number of spaces to indent
+ * @return string Indented text
+ */
+function indentLines(string $text, int $spaces): string
+{
+    $indent = str_repeat(' ', $spaces);
+    return preg_replace('/^/m', $indent, $text);
+}
+
+/**
  * Handle find command
  */
 function handleFindCommand(array $argv): void
@@ -644,9 +670,13 @@ function handleFindCommand(array $argv): void
         output()->writeln();
 
         output()->usageList('OPTIONS:', [
-            ['--project <path>', 'Search specific project root instead of current'],
+            ['--project <path>', 'Search specific project root (default: search from CWD downward)'],
             ['--limit <n>', 'Limit results (default: 20)'],
         ]);
+        output()->writeln();
+        output()->writeln("SEARCH SCOPE:");
+        output()->writeln("  By default, searches from current directory downward (like grep -r)");
+        output()->writeln("  Use --project to search entire project root");
 
         exit(0);
     }
@@ -657,11 +687,54 @@ function handleFindCommand(array $argv): void
 
         // Join FTS5 search with real table to get metadata
         // Use bm25() for ranking - lower is better (negative values)
-        // Use snippet() to show match context (will need detokenizing)
+        // Build WHERE clause that's shared between count and main query
+        $params = [$tokenizedQuery];
+
+        $whereClause = "WHERE code_index MATCH ?";
+
+        // Filter by project if specified
+        if ($projectPath !== null) {
+            $projectRoot = realpath($projectPath) ?: $projectPath;
+            $whereClause .= " AND e.filename LIKE ?";
+            $params[] = $projectRoot . '/%';
+        } else {
+            // Default: search from CWD downward (like grep)
+            // Detect the registered project root to ensure we're searching indexed files
+            $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd());
+            $cwd = getcwd();
+
+            // Search only within CWD and its subdirectories
+            $whereClause .= " AND e.filename LIKE ?";
+            $params[] = $cwd . '/%';
+        }
+
+        // Build shared FROM/JOIN clause
+        $fromClause = "
+            FROM code_index
+            JOIN code_entities e ON code_index.rowid = e.id
+            JOIN file_metadata f ON e.filename = f.filename
+        ";
+
+        // Get total count first
+        $countSql = "SELECT COUNT(*) as total" . $fromClause . $whereClause;
+        $countStmt = $db->prepare($countSql);
+        $countStmt->execute($params);
+        $totalMatches = $countStmt->fetchColumn();
+        output()->debug(2, "Total matches: {count}", ['count' => $totalMatches]);
+
+        // Build main query with snippet and rank calculations
         // Use random markers that won't appear in code
         $delim = bin2hex(random_bytes(4));
         $markerStart = 'BeF' . $delim;
         $markerEnd = 'AfT' . $delim;
+
+        // BM25 returns negative scores (closer to 0 = better match)
+        // Add age penalty using S-curve: recent files ~0, 1-year files ~2, older files asymptote to ~4
+        // Formula: 4 * (age_years^1.5) / (1 + age_years^1.5)
+        $oneYear = 365 * 24 * 60 * 60;
+        $now = time();
+        $agePenalty = "(4.0 * POWER((($now - f.filetime) / $oneYear.0), 1.5) / (1.0 + POWER((($now - f.filetime) / $oneYear.0), 1.5)))";
+
         $sql = "
             SELECT
                 e.preamble_raw,
@@ -672,68 +745,13 @@ function handleFindCommand(array $argv): void
                 e.line_start,
                 e.line_end,
                 bm25(code_index) as rank,
-                snippet(code_index, 2, '$markerStart', '$markerEnd', '...', 15) as body_snippet,
-                f.filetime
-            FROM code_index
-            JOIN code_entities e ON code_index.rowid = e.id
-            JOIN file_metadata f ON e.filename = f.filename
-            WHERE code_index MATCH ?
+                snippet(code_index, -1, '$markerStart', '$markerEnd', '...', 45) as body_snippet,
+                f.filetime,
+                (bm25(code_index) + $agePenalty) as adjusted_rank
+            " . $fromClause . $whereClause . "
+            ORDER BY adjusted_rank ASC
         ";
 
-        $params = [$tokenizedQuery];
-
-        // Filter by project if specified
-        if ($projectPath !== null) {
-            $projectRoot = realpath($projectPath) ?: $projectPath;
-            $sql .= " AND e.filename LIKE ?";
-            $params[] = $projectRoot . '/%';
-        } else {
-            // Auto-detect current project
-            $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd());
-            $sql .= " AND e.filename LIKE ?";
-            $params[] = $projectRoot . '/%';
-        }
-
-        // Get total count first
-        $countSql = str_replace(
-            "SELECT
-                e.preamble_raw,
-                e.signature_raw,
-                e.namespace,
-                e.type,
-                e.filename,
-                e.line_start,
-                e.line_end,
-                bm25(code_index) as rank,
-                snippet(code_index, 2, '$markerStart', '$markerEnd', '...', 15) as body_snippet,
-                f.filetime",
-            "SELECT COUNT(*) as total",
-            $sql
-        );
-        $countStmt = $db->prepare($countSql);
-        $countStmt->execute($params);
-        $totalMatches = $countStmt->fetchColumn();
-        output()->debug(2, "Total matches: {count}", ['count' => $totalMatches]);
-
-        // Order by rank (best matches first), with recency boost
-        // BM25 returns negative scores (closer to 0 = better match)
-        // Add age penalty to make older files MORE negative (worse)
-        // Use S-curve penalty: recent files ~0, 1-year files ~2, older files asymptote to ~4
-        $oneYear = 365 * 24 * 60 * 60;
-        $now = time();
-
-        // Add computed adjusted_rank to SELECT for verification
-        // Note: Can't use 'rank' alias in same SELECT, must use bm25(code_index) directly
-        // Use .0 suffix to force floating-point division in SQLite
-        // Formula: 4 * (age_years^1.5) / (1 + age_years^1.5)
-        // This creates an S-curve: 7d≈0.01, 90d≈0.4, 1y≈2.0, 2y≈3.0, 5y≈3.7
-        $sql = str_replace(
-            "f.filetime",
-            "f.filetime, (bm25(code_index) + (4.0 * POWER((($now - f.filetime) / $oneYear.0), 1.5) / (1.0 + POWER((($now - f.filetime) / $oneYear.0), 1.5)))) as adjusted_rank",
-            $sql
-        );
-
-        $sql .= " ORDER BY adjusted_rank ASC";
         // Fetch 3x the limit to account for filtering via canVisit()
         $fetchLimit = $limit * 3;
         $sql .= " LIMIT " . $fetchLimit;
@@ -790,11 +808,10 @@ function handleFindCommand(array $argv): void
         // Display results in rank order (no grouping)
         foreach ($results as $result) {
             $signature = trim($result['signature_raw']);
-            $preamble = trim($result['preamble_raw']);
             $filename = $result['filename'];
             $lineStart = $result['line_start'];
             $lineEnd = $result['line_end'];
-            $bodySnippet = $result['body_snippet'] ?? '';
+            $snippet = $result['body_snippet'] ?? '';
             $rank = $result['rank'];
             $filetime = $result['filetime'];
 
@@ -816,12 +833,18 @@ function handleFindCommand(array $argv): void
                 $relativeFilename = $filename;
             }
 
-            // Output: filename:startLine-endLine:
-            echo "$relativeFilename:$lineStart-$lineEnd:\n";
+            // Build result array: up to 3 levels of output
+            $output = [$relativeFilename . ':' . $lineStart . '-' . $lineEnd];
 
-            // Show snippet if available
-            if (!empty($bodySnippet)) {
-                $readableSnippet = \FubberTool\Index\Tokenizer::detokenize($bodySnippet);
+            // Decode snippet and prepare for display
+            $readableSnippet = '';
+            $snippetForLengthCheck = '';
+            if (!empty($snippet)) {
+                $readableSnippet = \FubberTool\Index\Tokenizer::detokenize($snippet, $markerStart, $markerEnd);
+
+                // Strip markers for length comparison (before adding color codes)
+                $snippetForLengthCheck = str_replace([$markerStart, $markerEnd], '', $readableSnippet);
+                $snippetForLengthCheck = trim($snippetForLengthCheck);
 
                 // Handle markers: colorize for TTY, strip for non-TTY
                 if ($isTty) {
@@ -830,22 +853,37 @@ function handleFindCommand(array $argv): void
                 } else {
                     $readableSnippet = str_replace([$markerStart, $markerEnd], '', $readableSnippet);
                 }
+                $readableSnippet = trim($readableSnippet);
+            }
 
-                // Format with signature if present
-                if (!empty($signature)) {
-                    // 2 space indent for signature with trailing colon
-                    echo "  $signature:\n";
-                    // 4 space indent for snippet (part of signature)
-                    echo "    " . trim($readableSnippet) . "\n";
+            // Add signature if present
+            $hasSignature = !empty($signature);
+            if ($hasSignature) {
+                $output[] = $signature;
+            }
+
+            // Add snippet only if it's longer than the signature
+            // This prevents showing useless/misleading FTS5 snippets that are just fragments
+            $hasSnippet = !empty($snippetForLengthCheck);
+            $snippetAdded = false;
+            if ($hasSnippet && (!$hasSignature || strlen($snippetForLengthCheck) > strlen($signature))) {
+                $output[] = $readableSnippet;
+                $snippetAdded = true;
+            }
+
+            // Render output with proper indentation and colons
+            // Colon logic: add colon after signature ONLY if there's a snippet following (not source fallback)
+            $signatureIndex = $hasSignature ? 1 : -1;
+            foreach ($output as $i => $line) {
+                $addColon = ($i === $signatureIndex && $snippetAdded);
+                $indentSpaces = $i * 2;
+
+                // For multi-line content, indent all lines
+                if (strpos($line, "\n") !== false) {
+                    $indented = indentLines($line, $indentSpaces);
+                    echo $indented . ($addColon ? ':' : '') . "\n";
                 } else {
-                    // 2 space indent for snippet (no signature)
-                    echo "  " . trim($readableSnippet) . "\n";
-                }
-            } elseif (!empty($preamble)) {
-                // Fallback: show first line of preamble if no snippet
-                $firstLine = strtok($preamble, "\n");
-                if (!empty($firstLine)) {
-                    echo "  " . trim($firstLine) . "\n";
+                    echo str_repeat(' ', $indentSpaces) . $line . ($addColon ? ':' : '') . "\n";
                 }
             }
 

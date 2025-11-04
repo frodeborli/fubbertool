@@ -28,21 +28,52 @@ class Tokenizer
 
     /**
      * Decode tokenized text back to readable format
-     * Reverses the hex encoding: _XX_ -> character
+     * Reverses the hex encoding: TxxK -> character
      *
-     * @param string $tokenized Tokenized text with _XX_ patterns
+     * @param string $tokenized Tokenized text with TxxK patterns
+     * @param string|null $markerStart Optional highlight marker start (e.g., 'BeF1234')
+     * @param string|null $markerEnd Optional highlight marker end (e.g., 'AfT1234')
      * @return string Decoded readable text
      */
-    public static function detokenize(string $tokenized): string
+    public static function detokenize(string $tokenized, ?string $markerStart = null, ?string $markerEnd = null): string
     {
         // Keep BEFORE/AFTER markers visible (don't remove them)
         $decoded = $tokenized;
 
-        // Decode TxxK patterns
-        $decoded = preg_replace_callback('/T([0-9a-f]{2})K/i', fn($m) => hex2bin($m[1]), $decoded);
+        // Build pattern to handle optional markers around TxxK tokens
+        // This handles snippet() wrapping individual tokens like: BeF...T3aKAfT... BeF...T3aKAfT...
+        if ($markerStart !== null && $markerEnd !== null) {
+            $pre = preg_quote($markerStart, '/');
+            $post = preg_quote($markerEnd, '/');
+
+            // Decode TxxK while preserving surrounding markers and consuming spaces
+            // Pattern: [space] [markerStart] TxxK [markerEnd] [space]
+            // Result: [markerStart] decoded_char [markerEnd] (no spaces)
+            $decoded = preg_replace_callback(
+                '/ ?(' . $pre . ')?T([0-9a-f]+)K(' . $post . ')? ?/i',
+                fn($m) => ($m[1] ?? '') . hex2bin($m[2]) . ($m[3] ?? ''),
+                $decoded
+            );
+
+            // Collapse marker pairs between consecutive tokens: AfT...BeF... → nothing
+            $decoded = preg_replace('/' . $post . $pre . '/i', '', $decoded);
+        } else {
+            // No markers - just decode TxxK patterns and consume surrounding spaces
+            $decoded = preg_replace_callback('/ ?T([0-9a-f]+)K ?/i', fn($m) => hex2bin($m[1]), $decoded);
+        }
 
         // Remove spaces around non-word characters
-        return preg_replace(['/\s+([^\w\s])\s+/', '/\s+([^\w\s])/', '/([^\w\s])\s+/'], ['$1', '$1', '$1'], $decoded);
+        $decoded = preg_replace(['/\s+([^\w\s])\s+/', '/\s+([^\w\s])/', '/([^\w\s])\s+/'], ['$1', '$1', '$1'], $decoded);
+
+        // Remove artificial spaces from camelCase splitting: lowercase + space + Uppercase+lowercase
+        // e.g., "get User By Id" → "getUserById"
+        // Use Unicode character classes to handle non-ASCII: \p{Ll}=lowercase, \p{Lu}=uppercase
+        // Apply repeatedly until no more matches (handles consecutive camelCase words)
+        while (preg_match('/(\p{Ll}) (\p{Lu}\p{Ll})/u', $decoded)) {
+            $decoded = preg_replace('/(\p{Ll}) (\p{Lu}\p{Ll})/u', '$1$2', $decoded);
+        }
+
+        return $decoded;
     }
 
     /**
@@ -205,6 +236,7 @@ class Tokenizer
         $res = [];
         $inQuotes = false;
         $quoteBuffer = [];
+        $previousWasWhitespace = true; // Start as true so we don't add '+' before first token
 
         foreach ($parts as $part) {
             // Handle quote delimiter
@@ -230,22 +262,59 @@ class Tokenizer
             }
 
             // Outside quotes - handle FTS5 operators
-            if ($part === '^' || $part === ':' || $part === '(' || $part === ')' ||
-                $part === '+' || $part === 'AND' || $part === 'OR' || $part === 'NOT' ||
-                $part === 'NEAR') {
+            // Special handling for ':' - only treat as operator if it follows a valid column name
+            if ($part === ':') {
+                $isColumnFilter = false;
+                if (!empty($res)) {
+                    // Get last non-whitespace part
+                    $lastPart = '';
+                    for ($i = count($res) - 1; $i >= 0; $i--) {
+                        if (trim($res[$i]) !== '') {
+                            $lastPart = trim($res[$i]);
+                            break;
+                        }
+                    }
+                    $validColumns = ['preamble', 'signature', 'body', 'namespace', 'ext', 'path'];
+                    $isColumnFilter = in_array(strtolower($lastPart), $validColumns, true);
+                }
+
+                if ($isColumnFilter) {
+                    // This is a column filter - pass through as FTS5 operator
+                    $res[] = $part;
+                    // Treat ':' like whitespace - next token should NOT have '+' prefix
+                    $previousWasWhitespace = true;
+                    continue; // Skip to next part
+                }
+                // Otherwise, fall through to tokenize it like regular code
+            } elseif ($part === '^' || $part === '(' || $part === ')' ||
+                      $part === '+' || $part === 'AND' || $part === 'OR' ||
+                      $part === 'NOT' || $part === 'NEAR') {
                 $res[] = $part;
+                $previousWasWhitespace = false;
+                continue;
             } elseif (trim($part) === '') {
                 $res[] = ' ';
-            } else {
-                // Tokenize search term using same logic as indexing
-                $t = self::tokenizeToArray($part, null); // No filename context for query tokenization
-                for ($i = 0; $i < count($t); $i++) {
-                    if ($i > 0) {
-                        $res[] = ' + ';  // Concatenation operator (adjacency)
-                    }
-                    $res[] = $t[$i];
-                }
+                $previousWasWhitespace = true;
+                continue;
             }
+
+            // Tokenize search term using same logic as indexing
+            // This handles both regular words and ':' (when not a column filter)
+            $t = self::tokenizeToArray($part, null);
+
+            // Add '+' before first token only if there was no whitespace before this part
+            for ($i = 0; $i < count($t); $i++) {
+                if ($i > 0) {
+                    // Always add '+' between tokens within the same part
+                    $res[] = ' + ';
+                } elseif (!$previousWasWhitespace) {
+                    // Add '+' before first token only if no whitespace before this part
+                    $res[] = ' + ';
+                }
+                $res[] = $t[$i];
+            }
+
+            $previousWasWhitespace = false;
         }
 
         return implode('', $res);

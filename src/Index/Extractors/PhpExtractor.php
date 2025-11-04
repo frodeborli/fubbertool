@@ -45,14 +45,14 @@ class PhpExtractor extends AbstractRegexExtractor
 
         if (empty($namespaces)) {
             // No namespace - treat entire file as global namespace
-            $classEntities = $this->extractClasses($content, '', $filename);
+            $classEntities = $this->extractClasses($content, '', $filename, $content);
             $entities = array_merge($entities, $classEntities);
 
             // Extract standalone functions (not inside classes)
             $contentWithoutClasses = $this->removeClassBodies($content, $filename);
             $entities = array_merge(
                 $entities,
-                $this->extractFunctions($contentWithoutClasses, '', '', $filename)
+                $this->extractFunctions($contentWithoutClasses, '', '', $filename, 0, $content)
             );
         } else {
             // Process each namespace
@@ -61,14 +61,14 @@ class PhpExtractor extends AbstractRegexExtractor
                 $nsContent = $ns[0]; // Full namespace block
 
                 // Extract classes within this namespace
-                $classEntities = $this->extractClasses($nsContent, $nsName, $filename);
+                $classEntities = $this->extractClasses($nsContent, $nsName, $filename, $content);
                 $entities = array_merge($entities, $classEntities);
 
                 // Extract standalone functions (not inside classes)
                 $contentWithoutClasses = $this->removeClassBodies($nsContent, $filename);
                 $entities = array_merge(
                     $entities,
-                    $this->extractFunctions($contentWithoutClasses, $nsName, '', $filename)
+                    $this->extractFunctions($contentWithoutClasses, $nsName, '', $filename, 0, $content)
                 );
             }
         }
@@ -133,7 +133,7 @@ class PhpExtractor extends AbstractRegexExtractor
     /**
      * Extract classes from content
      */
-    private function extractClasses(string $content, string $namespace, string $filename): array
+    private function extractClasses(string $content, string $namespace, string $filename, string $originalContent): array
     {
         $matches = $this->executePattern($this->classPattern, $content, $filename, 'classPattern');
         $entities = [];
@@ -151,10 +151,10 @@ class PhpExtractor extends AbstractRegexExtractor
             $entityType = strtolower($typeMatch[1]);
             $entityName = $typeMatch[2];
 
-            // Calculate line numbers from the full match
-            $startOffset = strpos($content, $match[0]);
+            // Calculate line numbers from the full match using original content
+            $startOffset = strpos($originalContent, $match[0]);
             $endOffset = $startOffset + strlen($match[0]);
-            $lines = $this->getLineNumbers($content, $startOffset, $endOffset);
+            $lines = $this->getLineNumbers($originalContent, $startOffset, $endOffset);
 
             $entities[] = [
                 'entity_type' => $entityType,
@@ -171,9 +171,13 @@ class PhpExtractor extends AbstractRegexExtractor
             ];
 
             // Extract methods from class body
+            // Calculate line offset: where the body starts in the original content
+            $bodyOffsetInOriginal = strpos($originalContent, $body);
+            $lineOffset = substr_count(substr($originalContent, 0, $bodyOffsetInOriginal), "\n");
+
             $entities = array_merge(
                 $entities,
-                $this->extractFunctions($body, $namespace, $entityName, $filename)
+                $this->extractFunctions($body, $namespace, $entityName, $filename, $lineOffset, $originalContent)
             );
         }
 
@@ -183,18 +187,22 @@ class PhpExtractor extends AbstractRegexExtractor
     /**
      * Extract functions/methods from content
      */
-    private function extractFunctions(string $content, string $namespace, string $className, string $filename): array
+    private function extractFunctions(string $content, string $namespace, string $className, string $filename, int $lineOffset = 0, ?string $originalContent = null): array
     {
+        // If no original content provided, use content as original
+        if ($originalContent === null) {
+            $originalContent = $content;
+        }
         $matches = $this->executePattern($this->functionPattern, $content, $filename, 'functionPattern');
         $entities = [];
 
         foreach ($matches as $match) {
-            $signature = trim($match['signature']);
+            $signatureRaw = trim($match['signature']);
             $preamble = $match['preamble'] ?? '';
             $body = $match['body'] ?? '';
 
             // Extract function name
-            if (!preg_match('/function\s+([a-z0-9_]+)/i', $signature, $funcMatch)) {
+            if (!preg_match('/function\s+([a-z0-9_]+)/i', $signatureRaw, $funcMatch)) {
                 continue;
             }
 
@@ -203,25 +211,27 @@ class PhpExtractor extends AbstractRegexExtractor
 
             // Extract visibility if present
             $visibility = '';
-            if (preg_match('/\b(public|protected|private)\b/', $signature, $visMatch)) {
+            if (preg_match('/\b(public|protected|private)\b/', $signatureRaw, $visMatch)) {
                 $visibility = $visMatch[1];
             }
 
-            // Calculate line numbers
-            $startOffset = strpos($content, $match[0]);
-            $endOffset = $startOffset + strlen($match[0]);
-            $lines = $this->getLineNumbers($content, $startOffset, $endOffset);
+            // Calculate line numbers from the signature (not preamble)
+            // Find where the signature text actually starts by searching for it after the preamble
+            $fullMatchStart = strpos($content, $match[0]);
+            $signatureStart = strpos($content, $signatureRaw, $fullMatchStart);
+            $matchEnd = $signatureStart + strlen($signatureRaw) + strlen($body);
+            $lines = $this->getLineNumbers($content, $signatureStart, $matchEnd);
 
             $entities[] = [
                 'entity_type' => $entityType,
                 'entity_name' => $functionName,
                 'namespace' => $namespace,
                 'class_name' => $className,
-                'signature' => preg_replace('/\s+/', ' ', $signature),
+                'signature' => preg_replace('/\s+/', ' ', $signatureRaw),
                 'docblock' => trim($preamble),
                 'body' => $body,
-                'line_start' => $lines['start'],
-                'line_end' => $lines['end'],
+                'line_start' => $lines['start'] + $lineOffset,
+                'line_end' => $lines['end'] + $lineOffset,
                 'language' => 'php',
                 'visibility' => $visibility,
             ];
