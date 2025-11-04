@@ -177,7 +177,7 @@ class FileDiscovery
         $fullPath = $fileInfo->getPathname();
         $parentDir = $fileInfo->getPath();
 
-        $partialPattern = self::canVisitGetIllegalPatterns($parentDir);
+        [ $partialPattern, $includePatterns ] = self::canVisitGetIllegalPatterns($parentDir);
 
         if ($partialPattern === '') {
             return true;
@@ -191,8 +191,17 @@ class FileDiscovery
 
         $regex = '/' . $partialPattern . '/';
 
-        // If matches, path is BLOCKED
-        return !preg_match($regex, $pathToCheck);
+        // If matches, path is definitely not blocked
+        if (!preg_match($regex, $pathToCheck)) {
+            return true;
+        }
+        // path is blocked, unless it's among include patterns
+        foreach ($includePatterns as $includePattern) {
+            if (preg_match('/' . $includePattern . '/', $pathToCheck)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -300,9 +309,9 @@ class FileDiscovery
      * Global patterns match anywhere, local patterns are anchored to directory.
      *
      * @param string $directory Directory to get patterns for
-     * @return string Partial regex pattern (without delimiters)
+     * @return {0: string, 1: string[]} Partial regex pattern (without delimiters)
      */
-    private static function canVisitGetIllegalPatterns(string $directory): string
+    private static function canVisitGetIllegalPatterns(string $directory): array
     {
         // Check cache first
         if (isset(self::$patternCache[$directory])) {
@@ -320,6 +329,8 @@ class FileDiscovery
                 $patterns = '(?!' . $subPattern . ')(' . $patterns . ')';
             }
         };
+        $includePatterns = [];
+
 
         if ($directory === self::$projectRoot) {
             // Global pattern: all dot-directories (e.g., .git, .venv, .idea, .cache)
@@ -336,11 +347,9 @@ class FileDiscovery
         } else {
             // Recursively get parent patterns
             $parentDir = dirname($directory);
-            $parentPattern = self::canVisitGetIllegalPatterns($parentDir);
-            //TODO: self::canVisitGetIllegalPatterns() should return [ $parentPattern, $includePaths ], and we should filter $includePaths to remove
-            //any paths that definitely doesn't apply here (must always keep $includePath that doesn't start with /, and also only keep $includePath
-            //when $parentDir . $includePath starts with $directory
-            //
+            [$parentPattern, $includePatterns] = self::canVisitGetIllegalPatterns($parentDir);
+            //TODO: filter $includePatterns inherited from parent. This needs careful attention; keeping them
+            //has a performance cost, but might not be problematic
             if ($parentPattern !== '') {
                 $addExcludePattern($parentPattern);
             }
@@ -363,14 +372,18 @@ class FileDiscovery
                 if ($pattern[0] !== '!') {
                     $addExcludePattern($dirQuoted . self::makePattern($pattern));
                 } else {
-                    $addIgnorePattern($dirQuoted . self::makePattern(substr($pattern, 1)));
+                    $pattern = substr($pattern, 1);
+                    $addIgnorePattern($dirQuoted . self::makePattern($pattern));
+                    if ($pattern[0] !== '/' || strpos($pattern, '/', 1) !== false) {
+                        // this pattern is either unanchored, or it reaches into subtrees
+                        $includePatterns[] = $dirQuoted . self::makePattern($pattern);
+                    }
                 }
             }
         }
 
         // Cache and return
-        self::$patternCache[$directory] = $patterns;
-        return $patterns;
+        return self::$patternCache[$directory] = [ $patterns, $includePatterns ];
     }
 
 }

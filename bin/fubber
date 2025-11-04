@@ -1100,7 +1100,7 @@ function handleDebugShouldGitignore(array $argv): void
         // Get the pattern that was used
         $canVisitMethod = $reflection->getMethod('canVisitGetIllegalPatterns');
         $canVisitMethod->setAccessible(true);
-        $pattern = $canVisitMethod->invoke(null, $fileInfo->getPath());
+        [$pattern, $includePatterns] = $canVisitMethod->invoke(null, $fileInfo->getPath());
 
         // Output results
         output()->writeln("Project root: $projectRoot");
@@ -1122,14 +1122,30 @@ function handleDebugShouldGitignore(array $argv): void
             output()->writeln("  /" . $pattern . "/");
         }
 
+        output()->writeln();
+        output()->writeln("Include patterns (mustVisitDirs):");
+        if (empty($includePatterns)) {
+            output()->writeln("  (none)");
+        } else {
+            foreach ($includePatterns as $inc) {
+                output()->writeln("  /" . $inc . "/");
+            }
+        }
+
         // Show pattern cache for debugging
         output()->writeln();
         output()->writeln("Pattern cache:");
         $cache = $patternCacheProperty->getValue(null);
-        foreach ($cache as $dir => $dirPattern) {
+        foreach ($cache as $dir => $dirData) {
             $relDir = str_replace($projectRoot, '.', $dir);
             output()->writeln("  $relDir:");
-            output()->writeln("    /" . $dirPattern . "/");
+            if (is_array($dirData)) {
+                [$dirPattern, $dirIncludes] = $dirData;
+                output()->writeln("    Pattern: /" . $dirPattern . "/");
+                output()->writeln("    Includes: " . (empty($dirIncludes) ? '(none)' : count($dirIncludes) . ' patterns'));
+            } else {
+                output()->writeln("    /" . $dirData . "/");
+            }
         }
 
     } catch (\Exception $e) {
