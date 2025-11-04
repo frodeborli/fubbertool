@@ -84,6 +84,12 @@ class ExtractorRegistry
     public function getExtractorForFile(string $filename): ?ExtractorInterface
     {
         $extension = pathinfo($filename, PATHINFO_EXTENSION);
+
+        // For files without extensions, use empty string to match extensionless extractors
+        if (empty($extension)) {
+            $extension = '';
+        }
+
         return $this->getExtractorForExtension(strtolower($extension));
     }
 
@@ -154,6 +160,7 @@ class ExtractorRegistry
         $registry->register(new CssExtractor());
         $registry->register(new MarkdownExtractor());
         $registry->register(new PythonExtractor());
+        $registry->register(new ExecutableScriptExtractor());
 
         // Could register fallback extractors with lower priority here
         // $registry->register(new SimplePhpExtractor());

@@ -105,7 +105,8 @@ class FileDiscovery
                     continue;
                 }
 
-                $language = self::detectLanguage($item->getFilename());
+                $isExecutable = $item->isExecutable();
+                $language = self::detectLanguage($item->getFilename(), $isExecutable);
                 if ($language) {
                     $files[$path] = [
                         'path' => $path,
@@ -122,11 +123,21 @@ class FileDiscovery
     }
 
     /**
-     * Detect file language from extension
+     * Detect file language from extension or executable script
+     *
+     * @param string $filename Filename or path
+     * @param bool $isExecutable Whether the file is executable
+     * @return string|null Language category or null if not supported
      */
-    private static function detectLanguage(string $filename): ?string
+    private static function detectLanguage(string $filename, bool $isExecutable = false): ?string
     {
         $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+        // If no extension and file is executable, mark as extensionless script
+        if (empty($extension) && $isExecutable) {
+            return 'script';
+        }
+
         return self::getLanguageForExtension($extension);
     }
 
@@ -139,6 +150,11 @@ class FileDiscovery
     public static function getLanguageForExtension(string $extension): ?string
     {
         $extension = strtolower($extension);
+
+        // Empty extension for extensionless executable scripts
+        if ($extension === '') {
+            return 'script';
+        }
 
         foreach (self::EXTENSIONS as $language => $extensions) {
             if (in_array($extension, $extensions)) {

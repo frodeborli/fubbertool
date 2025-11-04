@@ -229,6 +229,24 @@ class Output
     }
 
     /**
+     * Output a subtitle/section header
+     *
+     * @param string $subtitle The subtitle text
+     */
+    public function subtitle(string $subtitle): void
+    {
+        $this->interruptIfNeeded();
+
+        if ($this->isTty) {
+            fwrite($this->stream, self::COLOR_BRIGHT_WHITE . $subtitle . self::COLOR_RESET . "\n");
+        } else {
+            fwrite($this->stream, "## $subtitle\n");
+        }
+
+        $this->rerenderIfNeeded();
+    }
+
+    /**
      * Render a usage list (commands or options)
      *
      * @param string $listTitle The list title (e.g., "COMMANDS:")

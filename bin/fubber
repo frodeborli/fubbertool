@@ -294,27 +294,161 @@ function handleIndexStatusCommand(array $argv): void
             }
         }
 
-        echo "Project root: $projectRoot\n";
+        // === PROJECT OVERVIEW ===
+        output()->title("Index Status");
+        echo "Project: " . basename($projectRoot) . "\n";
+        echo "Path: $projectRoot\n";
 
         if ($projectInfo && $projectInfo['last_indexed']) {
             $lastIndexed = date('Y-m-d H:i:s', $projectInfo['last_indexed']);
-            echo "Last indexed: $lastIndexed\n";
+            $timeAgo = time() - $projectInfo['last_indexed'];
+            $timeAgoStr = formatTimeAgo($timeAgo);
+            echo "Last indexed: $lastIndexed ($timeAgoStr ago)\n";
         } else {
             echo "Last indexed: Never\n";
         }
 
-        // Count indexed files from file_metadata (fast - has index on project_root)
+        echo "\n";
+
+        // === SUMMARY STATISTICS ===
         $result = $db->queryRow("SELECT COUNT(*) as file_count, SUM(entry_count) as entity_count FROM file_metadata WHERE project_root = ?", [$projectRoot]);
         $fileCount = $result['file_count'] ?? 0;
         $entityCount = $result['entity_count'] ?? 0;
 
-        echo "Indexed entities: $entityCount\n";
-        echo "Indexed files: $fileCount\n";
+        output()->subtitle("Summary");
+        echo "Total files:    " . number_format($fileCount) . "\n";
+        echo "Total entities: " . number_format($entityCount) . "\n";
+
+        if ($fileCount > 0) {
+            $avgEntitiesPerFile = round($entityCount / $fileCount, 1);
+            echo "Avg entities/file: $avgEntitiesPerFile\n";
+        }
+
+        echo "\n";
+
+        // === FILES BY LANGUAGE ===
+        output()->subtitle("Files by Language");
+        $langStats = $db->query("
+            SELECT language, COUNT(*) as count, SUM(entry_count) as entities
+            FROM file_metadata
+            WHERE project_root = ?
+            GROUP BY language
+            ORDER BY count DESC
+        ", [$projectRoot]);
+
+        if (!empty($langStats)) {
+            $maxLangLen = max(array_map(fn($s) => strlen($s['language'] ?? 'unknown'), $langStats));
+            foreach ($langStats as $stat) {
+                $lang = $stat['language'] ?? 'unknown';
+                $count = number_format($stat['count']);
+                $entities = number_format($stat['entities']);
+                $langPadded = str_pad($lang, $maxLangLen);
+                $countPadded = str_pad($count, 6, ' ', STR_PAD_LEFT);
+                $entitiesPadded = str_pad($entities, 8, ' ', STR_PAD_LEFT);
+                echo "  $langPadded  $countPadded files  $entitiesPadded entities\n";
+            }
+        } else {
+            echo "  No files indexed\n";
+        }
+
+        echo "\n";
+
+        // === ENTITIES BY TYPE ===
+        output()->subtitle("Entities by Type");
+        $typeStats = $db->query("
+            SELECT type, COUNT(*) as count
+            FROM code_entities
+            WHERE filename IN (SELECT filename FROM file_metadata WHERE project_root = ?)
+            GROUP BY type
+            ORDER BY count DESC
+        ", [$projectRoot]);
+
+        if (!empty($typeStats)) {
+            $maxTypeLen = max(array_map(fn($s) => strlen($s['type']), $typeStats));
+            $totalEntities = array_sum(array_column($typeStats, 'count'));
+
+            foreach ($typeStats as $stat) {
+                $type = $stat['type'];
+                $count = $stat['count'];
+                $percentage = $totalEntities > 0 ? round(($count / $totalEntities) * 100, 1) : 0;
+                $typePadded = str_pad($type, $maxTypeLen);
+                $countPadded = str_pad(number_format($count), 8, ' ', STR_PAD_LEFT);
+                $percentStr = str_pad($percentage . '%', 6, ' ', STR_PAD_LEFT);
+                echo "  $typePadded  $countPadded  $percentStr\n";
+            }
+        } else {
+            echo "  No entities indexed\n";
+        }
+
+        echo "\n";
+
+        // === LARGEST FILES ===
+        output()->subtitle("Largest Files (by entity count)");
+        $largestFiles = $db->query("
+            SELECT filename, language, entry_count
+            FROM file_metadata
+            WHERE project_root = ?
+            ORDER BY entry_count DESC
+            LIMIT 5
+        ", [$projectRoot]);
+
+        if (!empty($largestFiles)) {
+            foreach ($largestFiles as $file) {
+                $relPath = str_replace($projectRoot . '/', '', $file['filename']);
+                $count = number_format($file['entry_count']);
+                $lang = $file['language'] ? "[$file[language]]" : '';
+                echo "  " . str_pad($count, 6, ' ', STR_PAD_LEFT) . " entities  $relPath $lang\n";
+            }
+        } else {
+            echo "  No files indexed\n";
+        }
+
+        echo "\n";
+
+        // === DATABASE SIZE ===
+        $dbPath = \FubberTool\Index\Schema::getDatabasePath();
+        if (file_exists($dbPath)) {
+            $dbSize = filesize($dbPath);
+            $dbSizeFormatted = formatBytes($dbSize);
+            output()->subtitle("Database");
+            echo "Size: $dbSizeFormatted\n";
+            if ($entityCount > 0) {
+                $bytesPerEntity = round($dbSize / $entityCount);
+                echo "Avg: " . formatBytes($bytesPerEntity) . "/entity\n";
+            }
+        }
 
     } catch (\Exception $e) {
         output()->error("Error: " . $e->getMessage());
         exit(1);
     }
+}
+
+/**
+ * Format time ago in human-readable format
+ */
+function formatTimeAgo(int $seconds): string
+{
+    if ($seconds < 60) return $seconds . 's';
+    if ($seconds < 3600) return round($seconds / 60) . 'm';
+    if ($seconds < 86400) return round($seconds / 3600) . 'h';
+    if ($seconds < 604800) return round($seconds / 86400) . 'd';
+    if ($seconds < 2592000) return round($seconds / 604800) . 'w';
+    return round($seconds / 2592000) . 'mo';
+}
+
+/**
+ * Format bytes in human-readable format
+ */
+function formatBytes(int $bytes): string
+{
+    $units = ['B', 'KB', 'MB', 'GB'];
+    $i = 0;
+    while ($bytes >= 1024 && $i < count($units) - 1) {
+        $bytes /= 1024;
+        $i++;
+    }
+    return round($bytes, 1) . $units[$i];
 }
 
 /**
