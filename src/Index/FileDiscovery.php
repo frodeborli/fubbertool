@@ -183,10 +183,114 @@ class FileDiscovery
             return true;
         }
 
+        // Append trailing slash for directories to match directory-only patterns (e.g., vendor/)
+        $pathToCheck = $fullPath;
+        if ($fileInfo->isDir()) {
+            $pathToCheck .= '/';
+        }
+
         $regex = '/' . $partialPattern . '/';
 
         // If matches, path is BLOCKED
-        return !preg_match($regex, $fullPath);
+        return !preg_match($regex, $pathToCheck);
+    }
+
+    /**
+     * Convert gitignore glob pattern to regex pattern
+     *
+     * Handles wildcards, character classes, anchoring
+     *
+     * @param string $pattern Gitignore pattern
+     * @return string Regex pattern (without delimiters)
+     */
+    private static function makePattern(string $pattern): string
+    {
+        // Remove trailing spaces
+        $pattern = rtrim($pattern);
+
+        if ($pattern === '') {
+            return '';
+        }
+
+        // Handle directory-only patterns (trailing /)
+        $dirOnly = str_ends_with($pattern, '/');
+        if ($dirOnly) {
+            $pattern = rtrim($pattern, '/');
+        }
+
+        // Handle anchored patterns (leading /)
+        $anchored = str_starts_with($pattern, '/');
+        if ($anchored) {
+            $pattern = ltrim($pattern, '/');
+        }
+
+        // Convert glob to regex
+        $regex = '';
+        $len = strlen($pattern);
+
+        for ($i = 0; $i < $len; $i++) {
+            $char = $pattern[$i];
+
+            if ($char === '*') {
+                // Check for ** (matches across directories)
+                if ($i + 1 < $len && $pattern[$i + 1] === '*') {
+                    $regex .= '.*';  // Match anything including /
+                    $i++; // Skip next *
+
+                    // Skip trailing / after **
+                    if ($i + 1 < $len && $pattern[$i + 1] === '/') {
+                        $regex .= '\/';
+                        $i++;
+                    }
+                } else {
+                    $regex .= '[^\/]*';  // Match anything except /
+                }
+            } elseif ($char === '?') {
+                $regex .= '[^\/]';  // Match single char except /
+            } elseif ($char === '[') {
+                // Character class - find closing ]
+                $j = $i + 1;
+                $bracketContent = '';
+                $negate = false;
+
+                // Check for negation [!...] or [^...]
+                if ($j < $len && ($pattern[$j] === '!' || $pattern[$j] === '^')) {
+                    $negate = true;
+                    $j++;
+                }
+
+                while ($j < $len && $pattern[$j] !== ']') {
+                    $bracketContent .= $pattern[$j];
+                    $j++;
+                }
+
+                if ($j < $len) {
+                    // Valid bracket expression
+                    $regex .= '[' . ($negate ? '^' : '') . preg_quote($bracketContent, '/') . ']';
+                    $i = $j;
+                } else {
+                    // No closing bracket, treat as literal
+                    $regex .= preg_quote($char, '/');
+                }
+            } else {
+                $regex .= preg_quote($char, '/');
+            }
+        }
+
+        // Add anchoring for unanchored patterns
+        if (!$anchored) {
+            // If pattern contains no /, it can match in any directory
+            if (strpos($pattern, '/') === false) {
+                $regex = '(?:.*\/)?' . $regex;
+            }
+        }
+
+        // Add directory-only constraint
+        if ($dirOnly) {
+            $regex .= '\/';
+        }
+
+        return $regex;
     }
 
     /**
@@ -205,42 +309,68 @@ class FileDiscovery
             return self::$patternCache[$directory];
         }
 
-        $patterns = [];
+        $patterns = '';
+        $addExcludePattern = function(string $subPattern) use (&$patterns) {
+            $patterns .= ($patterns !== '' ? '|' : '') . $subPattern;
+        };
+        $addIgnorePattern = function(string $subPattern) use (&$patterns) {
+            if ($patterns === '') {
+                $patterns = '(?!' . $subPattern . ').';
+            } else {
+                $patterns = '(?!' . $subPattern . ')(' . $patterns . ')';
+            }
+        };
 
         if ($directory === self::$projectRoot) {
             // Global pattern: all dot-directories (e.g., .git, .venv, .idea, .cache)
-            $patterns[] = '\/\.[^\/]+\/';
+            $addExcludePattern('\/\.[^\/]+\/');
 
             // Global patterns - unanchored, match anywhere in path
             $skipDirsPatterns = array_map(
                 fn($dir) => '\/' . preg_quote($dir, '/') . '\/',
                 self::SKIP_DIRS
             );
-            $patterns[] = implode('|', $skipDirsPatterns);
+            foreach ($skipDirsPatterns as $skipDirPattern) {
+                $addExcludePattern($skipDirPattern);
+            }
         } else {
             // Recursively get parent patterns
             $parentDir = dirname($directory);
             $parentPattern = self::canVisitGetIllegalPatterns($parentDir);
+            //TODO: self::canVisitGetIllegalPatterns() should return [ $parentPattern, $includePaths ], and we should filter $includePaths to remove
+            //any paths that definitely doesn't apply here (must always keep $includePath that doesn't start with /, and also only keep $includePath
+            //when $parentDir . $includePath starts with $directory
+            //
             if ($parentPattern !== '') {
-                $patterns[] = $parentPattern;
+                $addExcludePattern($parentPattern);
             }
         }
 
-        // TODO: Load local .gitignore patterns if exists
-        // $gitignorePath = $directory . '/.gitignore';
-        // if (file_exists($gitignorePath)) {
-        //     $localPatterns = self::loadGitignorePatterns($gitignorePath, $directory);
-        //     if ($localPatterns !== '') {
-        //         $patterns[] = $localPatterns;
-        //     }
-        // }
+        $dirQuoted = preg_quote($directory . DIRECTORY_SEPARATOR, '/');
 
-        // Combine all patterns
-        $result = implode('|', array_filter($patterns));
+        // Load local .gitignore patterns if exists
+        $gitignorePath = $directory . '/.gitignore';
+        if (is_readable($gitignorePath) && is_file($gitignorePath)) {
+            $localPatterns = file($gitignorePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            foreach ($localPatterns as $pattern) {
+                $pattern = trim($pattern);
+
+                // Skip empty lines and comments
+                if ($pattern === '' || $pattern[0] === '#') {
+                    continue;
+                }
+
+                if ($pattern[0] !== '!') {
+                    $addExcludePattern($dirQuoted . self::makePattern($pattern));
+                } else {
+                    $addIgnorePattern($dirQuoted . self::makePattern(substr($pattern, 1)));
+                }
+            }
+        }
 
         // Cache and return
-        self::$patternCache[$directory] = $result;
-        return $result;
+        self::$patternCache[$directory] = $patterns;
+        return $patterns;
     }
 
 }

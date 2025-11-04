@@ -148,6 +148,11 @@ if ($command === 'find') {
     exit(0);
 }
 
+if ($command === 'debug') {
+    handleDebugCommand($argv);
+    exit(0);
+}
+
 // Handle language-specific sub-commands
 if ($command === 'php') {
     // Delegate to fubber-php with remaining arguments
@@ -1022,6 +1027,109 @@ function handleFindCommand(array $argv): void
             }
 
             echo "\n";
+        }
+
+    } catch (\Exception $e) {
+        output()->error("Error: " . $e->getMessage());
+        exit(1);
+    }
+}
+
+/**
+ * Handle debug command
+ */
+function handleDebugCommand(array $argv): void
+{
+    $subcommand = $argv[2] ?? null;
+
+    if ($subcommand === null || $subcommand === '--help' || $subcommand === '-h') {
+        output()->writeln("USAGE:");
+        output()->writeln("  fubber debug <subcommand> [options]");
+        output()->writeln();
+        output()->usageList('SUBCOMMANDS:', [
+            ['should-gitignore <path>', 'Test if a path would be ignored by gitignore patterns'],
+        ]);
+        exit(0);
+    }
+
+    if ($subcommand === 'should-gitignore') {
+        handleDebugShouldGitignore($argv);
+    } else {
+        output()->error("Unknown debug subcommand: $subcommand");
+        exit(1);
+    }
+}
+
+/**
+ * Handle debug should-gitignore subcommand
+ */
+function handleDebugShouldGitignore(array $argv): void
+{
+    $path = $argv[3] ?? null;
+
+    if ($path === null) {
+        output()->error("Error: Path argument required");
+        output()->writeln("Usage: fubber debug should-gitignore <path>");
+        exit(1);
+    }
+
+    try {
+        $db = \FubberTool\Index\Schema::connect();
+        $projectRoot = \FubberTool\Index\ProjectDetector::detect($db, getcwd(), false);
+
+        // Resolve path relative to current directory
+        if (!str_starts_with($path, '/')) {
+            $path = getcwd() . '/' . $path;
+        }
+        $path = realpath($path) ?: $path;
+
+        // Initialize FileDiscovery static properties
+        $reflection = new ReflectionClass(\FubberTool\Index\FileDiscovery::class);
+        $projectRootProperty = $reflection->getProperty('projectRoot');
+        $projectRootProperty->setAccessible(true);
+        $projectRootProperty->setValue(null, $projectRoot);
+
+        $patternCacheProperty = $reflection->getProperty('patternCache');
+        $patternCacheProperty->setAccessible(true);
+        $patternCacheProperty->setValue(null, []);
+
+        // Test if path can be visited
+        $fileInfo = new SplFileInfo($path);
+        $canVisit = \FubberTool\Index\FileDiscovery::canVisit($fileInfo, $projectRoot);
+
+        // Get the pattern that was used
+        $canVisitMethod = $reflection->getMethod('canVisitGetIllegalPatterns');
+        $canVisitMethod->setAccessible(true);
+        $pattern = $canVisitMethod->invoke(null, $fileInfo->getPath());
+
+        // Output results
+        output()->writeln("Project root: $projectRoot");
+        output()->writeln("Path: $path");
+        output()->writeln("Parent dir: " . $fileInfo->getPath());
+        output()->writeln();
+
+        if ($canVisit) {
+            output()->writeln("Status: ALLOWED ✓");
+        } else {
+            output()->writeln("Status: IGNORED ✗");
+        }
+
+        output()->writeln();
+        output()->writeln("Pattern regex:");
+        if ($pattern === '') {
+            output()->writeln("  (no pattern - default allow)");
+        } else {
+            output()->writeln("  /" . $pattern . "/");
+        }
+
+        // Show pattern cache for debugging
+        output()->writeln();
+        output()->writeln("Pattern cache:");
+        $cache = $patternCacheProperty->getValue(null);
+        foreach ($cache as $dir => $dirPattern) {
+            $relDir = str_replace($projectRoot, '.', $dir);
+            output()->writeln("  $relDir:");
+            output()->writeln("    /" . $dirPattern . "/");
         }
 
     } catch (\Exception $e) {
